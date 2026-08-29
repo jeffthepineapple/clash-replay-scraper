@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# scrape output
+battles.csv
+plays.csv
+out/
+replays/
