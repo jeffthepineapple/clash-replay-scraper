@@ -9,8 +9,9 @@ Output: `battles.csv` and `plays.csv`, joinable on `replay_tag`.
 
 ## How it works
 
-- An anonymous headful Chromium (Playwright) solves RoyaleAPI's Cloudflare
-  challenge and holds the `cf_clearance` cookie. It does nothing else.
+- An anonymous headful browser (installed Google Chrome on Windows, Playwright
+  Chromium elsewhere) solves RoyaleAPI's Cloudflare challenge and holds the
+  `cf_clearance` cookie. It does nothing else.
 - Every actual fetch runs in parallel through `curl`, behind a self-tuning
   rate limiter that ramps up until RoyaleAPI answers 429 and then settles just
   under that ceiling (AIMD, same idea as TCP congestion control). The 429
@@ -32,6 +33,9 @@ Output: `battles.csv` and `plays.csv`, joinable on `replay_tag`.
   it).
 - Logged into [royaleapi.com](https://royaleapi.com) in at least one local
   browser (Battle Replay is a login-gated feature).
+- On Windows, Google Chrome must be installed. The scraper launches the stable
+  Chrome channel for Cloudflare verification instead of Playwright's bundled
+  Chromium.
 
 ## Install
 

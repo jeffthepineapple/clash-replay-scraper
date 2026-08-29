@@ -11,7 +11,8 @@ evolution and hero swaps allowed, no substituted cards. cannon/cannon-ev1 and
 musketeer/musketeer-hero all count as the same deck; swap in a Rocket and the
 battle is dropped.
 
-An anonymous headful Chromium solves the Cloudflare challenge and holds the
+An anonymous headful browser (Google Chrome on Windows, Chromium elsewhere)
+solves the Cloudflare challenge and holds the
 cf_clearance; every fetch then runs in parallel through curl behind a
 self-tuning rate limiter that probes RoyaleAPI's 429 threshold and stays under
 it (royale/limiter.py). The RoyaleAPI session cookie -- lifted from whichever
@@ -26,7 +27,7 @@ from __future__ import annotations
 import sys
 
 from royale import parse, pipeline
-from royale.cookies import find_sessions
+from royale.cookies import Session, find_sessions
 from royale.limiter import Limiter
 from royale.transport import AuthError, Curl, Pages
 from royale.ui import SEED, app, console
@@ -35,7 +36,6 @@ from royale.ui import SEED, app, console
 def selftest() -> None:
     """Smallest end-to-end check: every stage must yield sane data."""
     sessions = find_sessions()
-    assert sessions, "no RoyaleAPI session in any local browser"
 
     assert parse.base_cards("cannon-ev1,musketeer-hero") == {"cannon", "musketeer"}
     assert parse.is_variation("cannon,fireball,hog-rider,ice-golem,ice-spirit,"
@@ -44,9 +44,19 @@ def selftest() -> None:
 
     pages = Pages()
     try:
-        curl = Curl(pages, sessions[0])
-        assert curl.logged_in(), f"{sessions[0]} is not logged in"
-
+        curl = None
+        session = None
+        for candidate in sessions:
+            candidate_curl = Curl(pages, candidate)
+            if candidate_curl.logged_in():
+                curl = candidate_curl
+                session = candidate
+                break
+        if curl is None:
+            session = Session("this browser", pages.login())
+            curl = Curl(pages, session)
+            if not curl.logged_in():
+                raise AuthError("signed in, but RoyaleAPI still refuses the session")
         lim = curl.limiter
         start = lim.rate
 
@@ -95,7 +105,7 @@ def selftest() -> None:
         assert probe.rate > 10.0, "slow start did not grow"
     finally:
         pages.close()
-    console.print(f"[green]ok[/] {sessions[0]} | {len(decks)} decks, {len(players)} rated players, "
+    console.print(f"[green]ok[/] {session} | {len(decks)} decks, {len(players)} rated players, "
                   f"history {len(page1)} -> {len(paged)} over 3 pages, "
                   f"{len(rows)} variation battles ({dropped} dropped), "
                   f"{len(got)} replays in parallel, {len(plays)} card plays\n"

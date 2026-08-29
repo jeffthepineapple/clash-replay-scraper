@@ -11,7 +11,10 @@ the end of the progress bar.
 
 from __future__ import annotations
 
-import readline
+try:
+    import readline
+except ImportError:  # not part of the Python standard library on Windows
+    readline = None
 from pathlib import Path
 
 from rich.console import Console
@@ -125,12 +128,16 @@ def pick_players(players: dict[str, dict], order: list[str]) -> list[str]:
     labels = {f"{players[tag]['player_name']} #{tag}".strip(): tag for tag in order}
     options = sorted(labels) + sorted(f"#{t}" for t in order) + ["all"]
 
-    readline.set_completer_delims(",")
-    readline.set_completer(_completer(options))
-    readline.parse_and_bind("tab: complete")
+    if readline is not None:
+        readline.set_completer_delims(",")
+        readline.set_completer(_completer(options))
+        readline.parse_and_bind("tab: complete")
+        help_text = "[bold]TAB[/] completes names and tags"
+    else:
+        help_text = "type names or tags"
 
     console.print(Panel(
-        "[bold]TAB[/] completes names and tags  ·  numbers and ranges work "
+        f"{help_text}  ·  numbers and ranges work "
         "([cyan]1,4,7-9[/])  ·  [cyan]all[/] takes everyone\n"
         "add as many lines as you like, [bold]empty line[/] starts the crawl",
         title="pick players", border_style="cyan", expand=False))

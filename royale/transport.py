@@ -1,9 +1,9 @@
 """How this scraper talks to RoyaleAPI.
 
-Pages  an anonymous headful Chromium, used for one thing: solving the Cloudflare
-       challenge and holding the cf_clearance cookie it earns. Headful is not
-       optional -- headless Chromium is challenged and never gets through -- so
-       on Linux DISPLAY or WAYLAND_DISPLAY must be set.
+Pages  an anonymous headful browser, used for one thing: solving Cloudflare's
+       challenge and holding the cf_clearance cookie it earns. Installed Google
+       Chrome is preferred on Windows; Playwright Chromium is used elsewhere.
+       Headful is not optional, so Linux also needs DISPLAY or WAYLAND_DISPLAY.
 
 Curl   every actual fetch, run in parallel behind a shared rate Limiter. It
        borrows the browser's cf_clearance and UA (the clearance in a browser's
@@ -21,7 +21,11 @@ import sys
 import time
 from urllib.parse import urlencode, urlsplit
 
-from playwright.sync_api import Error as PlaywrightError, sync_playwright
+from playwright.sync_api import (
+    Error as PlaywrightError,
+    TimeoutError as PlaywrightTimeoutError,
+    sync_playwright,
+)
 
 from .cookies import SESSION_COOKIE, Session
 from .limiter import Limiter
@@ -59,16 +63,33 @@ class Pages:
             raise AuthError("no display: the anonymous browser must run headful "
                             "to clear Cloudflare")
         self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(
-            headless=False, args=["--disable-blink-features=AutomationControlled"])
+        launch = {
+            "headless": False,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
+        if sys.platform == "win32":
+            try:
+                # Use the user's installed, branded Chrome. Cloudflare can leave
+                # Playwright's bundled Chromium on its verification page forever.
+                self._browser = self._pw.chromium.launch(channel="chrome", **launch)
+            except PlaywrightError:
+                self._browser = self._pw.chromium.launch(**launch)
+        else:
+            self._browser = self._pw.chromium.launch(**launch)
         self._ctx = self._browser.new_context()
         self.page = self._ctx.new_page()
         self._route = lambda r: (r.abort() if r.request.resource_type in SKIP
                                  else r.continue_())
-        self.page.route("**/*", self._route)
         self.ua = self.page.evaluate("navigator.userAgent")
         self.clearance = ""
-        self.renew()
+        try:
+            # Cloudflare's verification must see a complete page. Resource
+            # filtering is safe only after the clearance cookie exists.
+            self.renew()
+        except Exception:
+            self.close()
+            raise
+        self.page.route("**/*", self._route)
 
     def renew(self) -> str:
         """Load the site and take whatever cf_clearance Cloudflare hands over.
@@ -78,8 +99,12 @@ class Pages:
         self.page.goto(f"{BASE}/", wait_until="domcontentloaded", timeout=60_000)
         # A fresh context lands on the interstitial; it self-solves in seconds.
         if self.page.title().startswith("Just a moment"):
-            self.page.wait_for_function(
-                "() => !document.title.startsWith('Just a moment')", timeout=60_000)
+            try:
+                self.page.wait_for_function(
+                    "() => !document.title.startsWith('Just a moment')", timeout=60_000)
+            except PlaywrightTimeoutError as e:
+                raise AuthError(
+                    "Cloudflare verification did not finish in 60 seconds in Chrome") from e
         self.clearance = self._cookie("cf_clearance") or self.clearance
         if not self.clearance:
             raise AuthError("browser never got a cf_clearance cookie -- challenge unsolved")
