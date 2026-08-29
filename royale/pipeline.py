@@ -78,18 +78,23 @@ def player_battles(client: Client, tag: str, max_pages: int = 0,
     path = f"/player/{tag}/battles/history"
     rows = [] if out is None else out
     seen = {b["replay_tag"] for b in rows}
+    visited = {path}
     page = 0
     while not max_pages or page < max_pages:
         html = client.get(path)
-        fresh = [b for b in parse.battles(html) if b["replay_tag"] not in seen]
-        if not fresh:
-            break
-        seen.update(b["replay_tag"] for b in fresh)
-        rows += fresh
+        # A page can hold nothing usable -- battles whose replay was never
+        # recorded parse to nothing -- and that says nothing about whether the
+        # archive continues. Only the pager decides when to stop; a repeated
+        # cursor is the guard against walking in a circle.
+        for b in parse.battles(html):
+            if b["replay_tag"] not in seen:
+                seen.add(b["replay_tag"])
+                rows.append(b)
         page += 1
         nxt = parse.next_history_page(html)
-        if not nxt:
+        if not nxt or nxt in visited:
             break
+        visited.add(nxt)
         path = nxt
     return rows
 
@@ -123,7 +128,8 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
     modes tallies the battle_type of every deck-matching battle seen, so the
     caller can show what the mode filter is actually choosing between.
     """
-    walk = {t: {"path": f"/player/{t}/battles/history", "rows": [], "seen": set(), "page": 0}
+    walk = {t: {"path": f"/player/{t}/battles/history", "rows": [], "seen": set(), "page": 0,
+                "visited": {f"/player/{t}/battles/history"}}
             for t in players}
     active = list(walk)
     rows: list[dict] = []
@@ -177,8 +183,12 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
                 w["seen"].update(b["replay_tag"] for b in fresh)
                 w["rows"] += fresh
                 w["page"] += 1
-                nxt = parse.next_history_page(res) if fresh else None
-                if nxt and (not max_pages or w["page"] < max_pages):
+                # An empty page means no replays were recorded for those battles,
+                # not the end of the archive: keep following the pager. A repeated
+                # cursor is what actually means stop.
+                nxt = parse.next_history_page(res)
+                if nxt and nxt not in w["visited"] and (not max_pages or w["page"] < max_pages):
+                    w["visited"].add(nxt)
                     w["path"] = nxt
                     still.append(tag)
                 else:
