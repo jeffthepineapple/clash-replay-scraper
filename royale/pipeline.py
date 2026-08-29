@@ -177,6 +177,9 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
                 if isinstance(res, Exception):
                     if on_error:
                         on_error(tag, res)
+                    # Keep what this player already gave up. They are left out of
+                    # the ledger, so the next run re-walks them from the top.
+                    harvest(tag)
                     tick()
                     continue
                 fresh = [b for b in parse.battles(res) if b["replay_tag"] not in w["seen"]]

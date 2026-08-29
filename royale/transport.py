@@ -33,7 +33,7 @@ from .limiter import Limiter
 BASE = "https://royaleapi.com"
 SKIP = ("image", "font", "media", "stylesheet")  # nothing we parse needs these
 RETRIES = 10     # per request, all of them 429 backoffs handed to the Limiter
-RENEWALS = 2     # 403s we try to fix by re-solving the challenge before giving up
+RENEWALS = 6     # 403s we try to fix by re-solving the challenge before giving up
 
 # Runs in the page, same origin, so the browser attaches that context's cookies
 # and uses the handshake the clearance was issued for. One failed URL must not
