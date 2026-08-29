@@ -123,6 +123,24 @@ class WindowsChromeTests(unittest.TestCase):
         self.assertEqual(curl_type.call_args_list[1].args[1].browser, "this browser")
         pages.close.assert_called_once_with()
 
+    def test_curl_replaces_undecodable_windows_output(self):
+        from royale import transport
+
+        process = MagicMock(returncode=0, stdout=b"payload\x81\n200", stderr=b"")
+        limiter = MagicMock()
+        pages = MagicMock(clearance="clearance", ua="Chrome user agent")
+        curl = transport.Curl(
+            pages,
+            self.ui.Session("chrome", "session"),
+            limiter=limiter,
+        )
+
+        with patch.object(transport.subprocess, "run", return_value=process):
+            body = curl.get("/me", auth=True)
+
+        self.assertEqual(body, "payload\ufffd")
+        limiter.ok.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

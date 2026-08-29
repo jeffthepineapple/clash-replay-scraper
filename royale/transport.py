@@ -204,13 +204,15 @@ class Curl:
             url += f"?{urlencode(params)}"
         for attempt in range(RETRIES):
             self.limiter.acquire()
-            p = subprocess.run(self._argv(url, auth), capture_output=True, text=True)
+            p = subprocess.run(self._argv(url, auth), capture_output=True)
+            stdout = p.stdout.decode("utf-8", errors="replace")
             if p.returncode != 0:
                 self.limiter.blocked()  # network wobble: same treatment, back off
                 if attempt == RETRIES - 1:
-                    raise RateLimited(f"curl exit {p.returncode} on {path}: {p.stderr.strip()}")
+                    stderr = p.stderr.decode("utf-8", errors="replace").strip()
+                    raise RateLimited(f"curl exit {p.returncode} on {path}: {stderr}")
                 continue
-            body, _, code = p.stdout.rpartition("\n")
+            body, _, code = stdout.rpartition("\n")
             status = int(code)
             if status == 429:
                 self.limiter.blocked()
