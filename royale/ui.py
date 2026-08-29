@@ -296,10 +296,16 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
         console.print(f"[yellow]skip[/] {what}: {e}")
 
     def on_sigint(*_):
+        """First Ctrl-C asks for a clean stop; the second must actually stop.
+
+        Handing the handler back to Python is what makes that true -- otherwise
+        this swallows every SIGINT and the only way out is to kill the process.
+        """
         nonlocal stop
         stop = True
-        console.print("\n[yellow]stopping after this group[/] -- everything written so far is "
-                      "safe; press Ctrl-C again to drop the group in flight")
+        signal.signal(signal.SIGINT, prev)
+        console.print("\n[yellow]stopping after this player[/] -- everything written so far is "
+                      "safe; press Ctrl-C again to stop right now")
 
     pipeline.write_players(outdir, players, found_on)
     ledger = pipeline.Ledger(outdir)
@@ -314,7 +320,8 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
     groups = [todo[i:i + group] for i in range(0, len(todo), group)]
     modes_all: dict[str, int] = {}
     total = 0
-    prev = signal.signal(signal.SIGINT, on_sigint)
+    prev = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, on_sigint)
     try:
         with pipeline.Sink(outdir) as sink:
             dead_logins = 0
@@ -341,6 +348,8 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
                 total += got
                 ledger.finish([tag], seed=seed, max_pages=max_pages, ranked_only=ranked_only)
                 dead_logins = dead_logins + 1 if (fresh and not got) else 0
+                if stop:
+                    raise KeyboardInterrupt
                 console.print(
                     f"[green]{players[tag]['player_name'][:20]}[/] [dim]#{tag}[/] "
                     f"r{players[tag]['rating']} · {len(kept)} kept · {got} replays · "
@@ -349,11 +358,15 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
             for gi, tags in enumerate(groups, 1):
                 head = f"group {gi}/{len(groups)}"
                 console.print(f"[cyan]{head}[/] walking {len(tags)} players")
-                rows, dropped, modes = pipeline.battles(
-                    client, {t: players[t] for t in tags}, found_on, seed, max_pages,
-                    on_error=lambda t, e: skip(f"battles {t}", e),
-                    keep_types=RANKED_TYPES if ranked_only else None,
-                    on_done=landed)
+                try:
+                    rows, dropped, modes = pipeline.battles(
+                        client, {t: players[t] for t in tags}, found_on, seed, max_pages,
+                        on_error=lambda t, e: skip(f"battles {t}", e),
+                        keep_types=RANKED_TYPES if ranked_only else None,
+                        on_done=landed)
+                except KeyboardInterrupt:
+                    console.print("[yellow]stopped[/]")
+                    break
                 for k, v in modes.items():
                     modes_all[k] = modes_all.get(k, 0) + v
                 console.print(f"[dim]{head} done · {dropped['deck']} other deck, "
