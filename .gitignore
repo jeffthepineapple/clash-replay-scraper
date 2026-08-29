@@ -8,3 +8,4 @@ battles.csv
 plays.csv
 out/
 replays/
+.DS_Store

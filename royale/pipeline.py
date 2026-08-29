@@ -2,76 +2,50 @@
 callback so the TUI can drive a progress bar without this module knowing about
 one. Stages are independent -- call only the ones a new feature needs.
 
-Every stage is fan-out over a thread pool. Threads are not the throttle: the
-shared Limiter inside `curl` is, so pool size only has to be big enough to keep
-the allowed rate saturated.
+Requests run inside the browser (see transport), which is pinned to one thread,
+so there is no thread pool here. Fan-out is a batch handed to Client.get_many
+and overlapped by the page; the Limiter still sets the pace on top.
 """
 
 from __future__ import annotations
 
 import csv
-from concurrent.futures import ThreadPoolExecutor
-from itertools import count
+import json
 from pathlib import Path
 from typing import Callable, Iterable
 
 from . import parse
-from .transport import BASE, ClearanceExpired, Curl
+from .transport import BASE, Client, url
 
 Tick = Callable[[], None]
-DEFAULT_POOL = 4  # concurrent in-flight requests; kept low, the Limiter tunes the rate on top
-
-BATTLE_FIELDS = [
-    "replay_tag", "deck", "player_tag", "player_name", "clan_tag", "rating", "rank", "wins_7d",
-    "battle_time", "battle_timestamp", "battle_type", "result", "team_tags", "opponent_tags",
-    "team_crowns", "opponent_crowns", "team_deck", "opponent_deck",
-    "team_elixir_total", "team_elixir_troop", "team_elixir_building", "team_elixir_spell",
-    "team_elixir_leaked", "oppo_elixir_total", "oppo_elixir_troop", "oppo_elixir_building",
-    "oppo_elixir_spell", "oppo_elixir_leaked", "plays",
-]
-PLAY_FIELDS = ["replay_tag", "play_index", "tick", "seconds", "side", "card", "ability"]
+DEFAULT_BATCH = 6   # requests overlapped per round trip into the page
+HISTORY_SLICE = 50  # players whose next page is held in memory at once
 
 
 def _noop() -> None:
     pass
 
 
-def _fan(items: list, fn, workers: int, tick: Tick, on_error) -> list[tuple]:
-    """Run fn over items in parallel, keeping (item, result) for the ones that
-    worked. Ctrl-C and an expired Cloudflare pass both stop the wave and keep
-    whatever already landed.
-    """
-    def attempt(item):
-        try:
-            return fn(item)
-        except Exception as e:  # one bad item must not kill the wave
-            return e
-
-    out, pool = [], ThreadPoolExecutor(max(1, workers))
-    try:
-        for item, res in zip(items, pool.map(attempt, items)):
-            tick()
-            if isinstance(res, Exception):
-                if on_error:
-                    on_error(item, res)
-                if isinstance(res, ClearanceExpired):
-                    break
-            else:
-                out.append((item, res))
-    except KeyboardInterrupt:
-        pass
-    finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+def _report(items: list, results: list, tick: Tick, on_error) -> list[tuple]:
+    """Pair items with their results, reporting and dropping the failures."""
+    out = []
+    for item, res in zip(items, results):
+        tick()
+        if isinstance(res, Exception):
+            if on_error:
+                on_error(item, res)
+        else:
+            out.append((item, res))
     return out
 
 
 # ---------------------------------------------------------------- stages
-def similar_decks(curl: Curl, seed: str, limit: int = 25) -> list[str]:
-    return parse.similar_decks(curl.get(f"/decks/stats/{seed}/similar"), seed)[:limit]
+def similar_decks(client: Client, seed: str, limit: int = 25) -> list[str]:
+    return parse.similar_decks(client.get(f"/decks/stats/{seed}/similar"), seed)[:limit]
 
 
-def rated_players(curl: Curl, decks: Iterable[str], per_deck: int | None = None,
-                  workers: int = DEFAULT_POOL, tick: Tick = _noop, on_error=None,
+def rated_players(client: Client, decks: Iterable[str], per_deck: int | None = None,
+                  tick: Tick = _noop, on_error=None,
                   ) -> tuple[dict[str, dict], dict[str, str]]:
     """Ratings boards for every deck -> (tag -> player, tag -> deck found on).
 
@@ -79,43 +53,40 @@ def rated_players(curl: Curl, decks: Iterable[str], per_deck: int | None = None,
     battle crawl visits each player exactly once.
     """
     decks = list(decks)
-    fetched = _fan(decks, lambda d: parse.rated_players(
-        curl.get(f"/decks/stats/{d}/players/ratings")), workers, tick, on_error)
+    got = client.get_many([f"/decks/stats/{d}/players/ratings" for d in decks])
+    fetched = _report(decks, got, tick, on_error)
 
     players: dict[str, dict] = {}
     found_on: dict[str, str] = {}
-    for deck, rows in fetched:
-        for p in rows[:per_deck]:
+    for deck, html in fetched:
+        for p in parse.rated_players(html)[:per_deck]:
             players.setdefault(p["player_tag"], p)
             found_on.setdefault(p["player_tag"], deck)
     return players, found_on
 
 
-def player_battles(curl: Curl, tag: str, max_pages: int = 0,
+def player_battles(client: Client, tag: str, max_pages: int = 0,
                    out: list[dict] | None = None) -> list[dict]:
-    """A player's battle history, following the pager's 'older' link.
+    """One player's battle history, following the pager's 'older' link.
 
     /battles/history serves 10 battles a page and its next link carries
     ?before=<oldest battle, epoch ms>, so this walks back through the whole
     archive -- far deeper than the battles page's infinite scroll. Sequential by
     necessity: page N+1's cursor is only known once page N is parsed, which is
-    why parallelism lives across players instead.
-
-    max_pages == 0 walks to the end. `out` is appended to as pages arrive, so an
-    interrupt leaves the caller holding everything fetched so far.
+    why the crawl overlaps players instead (see `battles`).
     """
     path = f"/player/{tag}/battles/history"
     rows = [] if out is None else out
     seen = {b["replay_tag"] for b in rows}
-    for page in count(1):
-        if max_pages and page > max_pages:
-            break
-        html = curl.get(path)
+    page = 0
+    while not max_pages or page < max_pages:
+        html = client.get(path)
         fresh = [b for b in parse.battles(html) if b["replay_tag"] not in seen]
         if not fresh:
             break
         seen.update(b["replay_tag"] for b in fresh)
         rows += fresh
+        page += 1
         nxt = parse.next_history_page(html)
         if not nxt:
             break
@@ -123,26 +94,76 @@ def player_battles(curl: Curl, tag: str, max_pages: int = 0,
     return rows
 
 
-def battles(curl: Curl, players: dict[str, dict], found_on: dict[str, str], seed: str,
-            max_pages: int = 0, workers: int = DEFAULT_POOL, tick: Tick = _noop, on_error=None,
-            ) -> tuple[list[dict], int]:
-    """Battle rows for every player in parallel, keeping only games played on a
-    variation of `seed` -- same base cards, evo/hero swaps allowed, no
-    substituted cards.
+def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], seed: str,
+            max_pages: int = 0, tick: Tick = _noop, on_error=None,
+            keep_types: frozenset[str] | None = None,
+            ) -> tuple[list[dict], dict[str, int], dict[str, int]]:
+    """Battle rows for every player, keeping only games played on a variation of
+    `seed` -- same base cards, evo/hero swaps allowed, no substituted cards.
 
-    Returns (rows, dropped) so the caller can report what the filter removed.
+    Each player's history must be walked in order, but different players are
+    independent, so this advances every player by one page per round and fetches
+    that round as one batch. Slow players stay in the rotation until their
+    archive runs out; finished ones drop out and tick the progress bar.
+
+    keep_types narrows further to game modes: a battle survives when its
+    battle_type contains any of these substrings. None keeps every mode.
+    Substring, not equality, because RoyaleAPI's battletype-* class names carry
+    suffixes (ranked_1v1, pathoflegend_1v1, ...) that shift between seasons.
+
+    Returns (rows, dropped, modes) -- dropped counts what each filter removed,
+    modes tallies the battle_type of every deck-matching battle seen, so the
+    caller can show what the mode filter is actually choosing between.
     """
-    tags = list(players)
-    fetched = _fan(tags, lambda t: player_battles(curl, t, max_pages), workers, tick, on_error)
+    walk = {t: {"path": f"/player/{t}/battles/history", "rows": [], "seen": set(), "page": 0}
+            for t in players}
+    active = list(walk)
 
-    rows, dropped = [], 0
-    for tag, got in fetched:
-        for b in got:
+    try:
+        while active:
+            got: list = []
+            for i in range(0, len(active), HISTORY_SLICE):
+                slice_ = active[i:i + HISTORY_SLICE]
+                got += client.get_many([walk[t]["path"] for t in slice_])
+            still: list[str] = []
+            for tag, res in zip(active, got):
+                w = walk[tag]
+                if isinstance(res, Exception):
+                    if on_error:
+                        on_error(tag, res)
+                    tick()
+                    continue
+                fresh = [b for b in parse.battles(res) if b["replay_tag"] not in w["seen"]]
+                w["seen"].update(b["replay_tag"] for b in fresh)
+                w["rows"] += fresh
+                w["page"] += 1
+                nxt = parse.next_history_page(res) if fresh else None
+                if nxt and (not max_pages or w["page"] < max_pages):
+                    w["path"] = nxt
+                    still.append(tag)
+                else:
+                    tick()  # this player's archive is done
+            active = still
+    except KeyboardInterrupt:
+        pass  # keep everything already fetched
+
+    rows: list[dict] = []
+    dropped = {"deck": 0, "mode": 0}
+    modes: dict[str, int] = {}
+    for tag, w in walk.items():
+        for b in w["rows"]:
             if not parse.is_variation(b["team_deck"], seed):
-                dropped += 1
+                dropped["deck"] += 1
+                continue
+            bt = b["battle_type"] or "?"
+            modes[bt] = modes.get(bt, 0) + 1
+            # RoyaleAPI's class names are camelCase (pathOfLegend); match case-blind
+            # so a season's rename of the casing cannot silently empty the crawl.
+            if keep_types is not None and not any(k in bt.lower() for k in keep_types):
+                dropped["mode"] += 1
                 continue
             rows.append({"deck": found_on.get(tag, seed), **players[tag], **b})
-    return rows, dropped
+    return rows, dropped, modes
 
 
 def replay_params(b: dict) -> dict:
@@ -153,32 +174,165 @@ def replay_params(b: dict) -> dict:
     }
 
 
-def fetch_replay(curl: Curl, b: dict) -> tuple[dict, list[dict]]:
-    data = curl.json("/data/replay", replay_params(b))
+def _parse_replay(raw: str, b: dict) -> tuple[dict, list[dict]]:
+    import json
+    data = json.loads(raw)
     if not data.get("success"):
         raise RuntimeError(f"replay {b['replay_tag']} refused (login expired?)")
     return parse.replay(data["html"])
 
 
-def replays(curl: Curl, rows: list[dict], workers: int = DEFAULT_POOL,
-            tick: Tick = _noop, on_error=None,
-            ) -> list[tuple[dict, tuple[dict, list[dict]]]]:
-    return _fan(rows, lambda b: fetch_replay(curl, b), workers, tick, on_error)
+def fetch_replay(client: Client, b: dict) -> tuple[dict, list[dict]]:
+    return _parse_replay(client.get("/data/replay", replay_params(b), auth=True), b)
+
+
+# Replay payloads are ~100KB of JSON each, so they are fetched a slice at a time
+# and parsed down to rows before the next slice is asked for. Wide enough that the
+# client still gets to pick its own burst width underneath.
+REPLAY_SLICE = 24
+
+
+def replays(client: Client, rows: list[dict], tick: Tick = _noop, on_error=None,
+            sink: "Sink | None" = None) -> int:
+    """Replay timelines. The only login-gated stage.
+
+    Rows go to `sink` as each slice lands rather than being accumulated, so a
+    crash, a killed terminal or a dead laptop battery costs the current slice
+    and nothing else. Returns the number of battles written.
+    """
+    n = 0
+    try:
+        for i in range(0, len(rows), REPLAY_SLICE):
+            chunk = rows[i:i + REPLAY_SLICE]
+            got = client.get_many(
+                [url("/data/replay", replay_params(b)) for b in chunk], auth=True, tick=tick)
+            for b, raw in zip(chunk, got):
+                try:
+                    if isinstance(raw, Exception):
+                        raise raw
+                    stats, plays = _parse_replay(raw, b)
+                except Exception as e:
+                    if on_error:
+                        on_error(b, e)
+                    continue
+                if sink and not sink.write(b, stats, plays):
+                    continue  # same battle reached from the other player's history
+                n += 1
+    except KeyboardInterrupt:
+        pass  # everything already written stays written
+    return n
 
 
 # ---------------------------------------------------------------- output
-def write_csv(outdir: Path, got: list[tuple[dict, tuple[dict, list[dict]]]]
-              ) -> tuple[Path, Path, int]:
-    """battles.csv + plays.csv, joinable on replay_tag."""
+BATTLE_FIELDS = [
+    "replay_tag", "deck", "player_tag", "player_name", "clan_tag", "rating", "rank", "wins_7d",
+    "battle_time", "battle_timestamp", "battle_type", "result", "team_tags", "opponent_tags",
+    "team_crowns", "opponent_crowns", "team_deck", "opponent_deck",
+    "team_elixir_total", "team_elixir_troop", "team_elixir_building", "team_elixir_spell",
+    "team_elixir_leaked", "oppo_elixir_total", "oppo_elixir_troop", "oppo_elixir_building",
+    "oppo_elixir_spell", "oppo_elixir_leaked", "team_cards", "oppo_cards", "plays",
+]
+# x/y are tiles on the 18x32 arena; *_raw are the source thousandths. Both blank
+# on hero-ability rows, which are events rather than placements.
+PLAY_FIELDS = ["replay_tag", "play_index", "tick", "seconds", "side", "card", "ability",
+               "x", "y", "x_raw", "y_raw"]
+
+
+class Ledger:
+    """Which players are finished, kept on disk beside the CSVs.
+
+    The Sink already stops a replay being fetched twice, but only after its
+    battle history has been walked again. This records whole players, so a
+    restarted overnight run skips their history too and picks up where it
+    stopped rather than where it started.
+    """
+
+    def __init__(self, outdir: Path, name: str = "progress.json"):
+        self.path = outdir / name
+        self.done: set[str] = set()
+        self.meta: dict = {}
+        if self.path.exists():
+            try:
+                blob = json.loads(self.path.read_text())
+                self.done = set(blob.get("players_done", []))
+                self.meta = blob.get("meta", {})
+            except (ValueError, OSError):
+                pass  # a half-written ledger just means starting over, not crashing
+
+    def finish(self, tags: Iterable[str], **meta) -> None:
+        self.done.update(tags)
+        self.meta.update(meta)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(
+            {"players_done": sorted(self.done), "meta": self.meta}, indent=1))
+        tmp.replace(self.path)  # atomic: a kill mid-write cannot corrupt the ledger
+
+
+PLAYER_FIELDS = ["player_tag", "player_name", "clan_tag", "rating", "rank", "wins_7d", "deck"]
+
+
+def write_players(outdir: Path, players: dict[str, dict], found_on: dict[str, str]) -> Path:
+    """The roster as crawled, so a later run can be reconciled against it."""
     outdir.mkdir(parents=True, exist_ok=True)
-    battles_csv, plays_csv = outdir / "battles.csv", outdir / "plays.csv"
-    n_plays = 0
-    with battles_csv.open("w", newline="") as bf, plays_csv.open("w", newline="") as pf:
-        bw, pw = csv.DictWriter(bf, BATTLE_FIELDS), csv.DictWriter(pf, PLAY_FIELDS)
-        bw.writeheader()
-        pw.writeheader()
-        for b, (stats, plays) in got:
-            bw.writerow({**b, **stats, "plays": len(plays)})
-            pw.writerows(plays)
-            n_plays += len(plays)
-    return battles_csv, plays_csv, n_plays
+    path = outdir / "players.csv"
+    with path.open("w", newline="") as f:
+        w = csv.DictWriter(f, PLAYER_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for tag, p in players.items():
+            w.writerow({**p, "deck": found_on.get(tag, "")})
+    return path
+
+
+class Sink:
+    """battles.csv + plays.csv, joinable on replay_tag, written as rows land.
+
+    Opening an existing pair in append mode makes a rerun resume rather than
+    start over: `done` is every replay_tag already on disk, so the caller can
+    drop those before spending requests on them. Each battle is flushed as it is
+    written, which is what makes an interrupted overnight run cost nothing.
+    """
+
+    def __init__(self, outdir: Path, resume: bool = True):
+        outdir.mkdir(parents=True, exist_ok=True)
+        self.battles_csv = outdir / "battles.csv"
+        self.plays_csv = outdir / "plays.csv"
+        self.done: set[str] = set()
+        append = resume and self.battles_csv.exists() and self.plays_csv.exists()
+        if append:
+            with self.battles_csv.open(newline="") as f:
+                self.done = {r["replay_tag"] for r in csv.DictReader(f) if r.get("replay_tag")}
+        self._bf = self.battles_csv.open("a" if append else "w", newline="")
+        self._pf = self.plays_csv.open("a" if append else "w", newline="")
+        self._bw = csv.DictWriter(self._bf, BATTLE_FIELDS, extrasaction="ignore")
+        self._pw = csv.DictWriter(self._pf, PLAY_FIELDS, extrasaction="ignore")
+        if not append:
+            self._bw.writeheader()
+            self._pw.writeheader()
+        self.battles = 0
+        self.plays = 0
+
+    def write(self, b: dict, stats: dict, plays: list[dict]) -> bool:
+        """False if this replay_tag is already on disk. Two roster players who
+        fought each other yield the same battle from both sides, so writing has
+        to be idempotent or the CSVs gain duplicate keys and plays.csv
+        double-counts that battle's placements."""
+        if b["replay_tag"] in self.done:
+            return False
+        self._bw.writerow({**b, **stats, "plays": len(plays)})
+        self._pw.writerows(plays)
+        self._bf.flush()
+        self._pf.flush()
+        self.battles += 1
+        self.plays += len(plays)
+        self.done.add(b["replay_tag"])
+        return True
+
+    def close(self) -> None:
+        self._bf.close()
+        self._pf.close()
+
+    def __enter__(self) -> "Sink":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()

@@ -106,10 +106,14 @@ def next_history_page(html: str) -> str | None:
 
 ELIXIR_ROWS = ("total", "troop", "building", "spell")
 
+# Placement coordinates are thousandths of a tile on an 18x32 arena.
+TILE = 1000
+
 
 def _elixir(table) -> dict:
     """Rows read 'Total 35 87', 'Troop 24 58', ..., 'Leaked 0.37'.
-    Column 1 is the card count, column 2 the elixir spent; keep the elixir."""
+    Column 1 is the card count, column 2 the elixir spent; keep both for Total,
+    since the card count is what the placement parse gets validated against."""
     vals = {}
     for tr in table.select("tr"):
         cells = [td.get_text(strip=True) for td in tr.select("td, th")]
@@ -118,36 +122,89 @@ def _elixir(table) -> dict:
         key = cells[0].strip().lower()
         if key in ELIXIR_ROWS:
             vals[key] = cells[2] if len(cells) > 2 else cells[1]
+            if key == "total" and len(cells) > 2:
+                vals["cards"] = cells[1]
         elif key == "leaked":
             vals["leaked"] = cells[1]
     return vals
 
 
+def _tile(raw: str) -> str:
+    """data-x/data-y are thousandths of a tile, or the string 'None' on the
+    hero-ability rows, which are events rather than placements."""
+    try:
+        return f"{int(raw) / TILE:.3f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def markers(d) -> list:
+    """The map's placement markers, one per card played.
+
+    Class-list selectors, not an exact class match: real markers come through as
+    'blue marker', 'red marker tl raised' and other combinations, and pinning
+    the whole attribute silently drops the decorated ones.
+    """
+    return d.select("div.marker.blue, div.marker.red")
+
+
 def replay(html: str) -> tuple[dict, list[dict]]:
-    """(battle-level stats, one row per card play) from a /data/replay payload."""
+    """(battle-level stats, one row per card play) from a /data/replay payload.
+
+    Position comes off the map markers (data-x/data-y/data-c/data-t) and the
+    hero-ability flag off the timeline cards (data-ability); they are the same
+    plays twice over, so they join on (side, card, tick). If a replay ever
+    arrives without markers the timeline alone still yields rows, minus
+    coordinates.
+    """
     d = BeautifulSoup(html, "lxml")
     root = d.select_one(".battle_replay")
     tag = root.get("data-tag", "") if root else ""
 
-    plays = []
-    # DOM order groups cards by lane, not by time: sort so the CSV reads as a timeline.
-    cards = sorted(d.select(".replay_timeline .replay_card"),
-                   key=lambda c: int(c.get("data-t", 0)))
-    for c in cards:
-        tick = int(c.get("data-t", 0))
-        plays.append({
+    # Same play, two elements: the timeline card carries the ability flag, the
+    # marker carries the position. Keyed as a list because a side can replay the
+    # same card on the same tick.
+    abilities: dict[tuple, list[str]] = {}
+    for c in d.select(".replay_timeline .replay_card"):
+        key = (c.get("data-s", ""), c.get("data-card", ""), c.get("data-t", "0"))
+        abilities.setdefault(key, []).append(c.get("data-ability", ""))
+
+    def row(side: str, card: str, raw_t: str, x: str = "", y: str = "") -> dict:
+        tick = int(raw_t or 0)
+        got = abilities.get((side, card, raw_t))
+        return {
             "replay_tag": tag,
-            "play_index": len(plays),
+            "play_index": 0,  # filled in below, once the timeline is ordered
             "tick": tick,
             "seconds": round(tick / TPS, 2),
-            "side": c.get("data-s", ""),   # blue = the player whose log this is
-            "card": c.get("data-card", ""),
-            "ability": c.get("data-ability", ""),
-        })
+            "side": side,     # blue = the player whose log this is
+            "card": card,
+            "ability": got.pop(0) if got else "",
+            "x": _tile(x),
+            "y": _tile(y),
+            "x_raw": x if x.lstrip("-").isdigit() else "",
+            "y_raw": y if y.lstrip("-").isdigit() else "",
+        }
+
+    found = markers(d)
+    if found:
+        plays = [row("blue" if "blue" in m.get("class", []) else "red",
+                     m.get("data-c", ""), m.get("data-t", "0"),
+                     m.get("data-x", ""), m.get("data-y", ""))
+                 for m in found]
+    else:  # no map in this payload: timeline only, no coordinates
+        plays = [row(c.get("data-s", ""), c.get("data-card", ""), c.get("data-t", "0"))
+                 for c in d.select(".replay_timeline .replay_card")]
+
+    # DOM order groups by lane, not by time: sort so the CSV reads as a timeline.
+    plays.sort(key=lambda p: p["tick"])
+    for i, p in enumerate(plays):
+        p["play_index"] = i
 
     stats = {}
     for prefix, table in zip(("team", "oppo"), d.select("table.replay_elixir_table")):
         v = _elixir(table)
         for k in (*ELIXIR_ROWS, "leaked"):
             stats[f"{prefix}_elixir_{k}"] = v.get(k, "")
+        stats[f"{prefix}_cards"] = v.get("cards", "")
     return stats, plays

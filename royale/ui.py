@@ -12,6 +12,7 @@ the end of the progress bar.
 from __future__ import annotations
 
 import readline
+import signal
 from pathlib import Path
 
 from rich.console import Console
@@ -22,10 +23,21 @@ from rich.table import Table
 from . import parse, pipeline
 from .cookies import Session, find_sessions
 from .limiter import Limiter
-from .transport import AuthError, Curl, Pages
+from .transport import AuthError, Client, Pages
 
 SEED = "cannon-ev1,fireball,hog-rider,ice-golem,ice-spirit,musketeer,skeletons,the-log"
 OUTDIR = Path(".")
+
+# Players never crawled, however they are picked -- 'all' included. Names are
+# compared exactly (case-folded); tags are the reliable key once you can see one
+# in the roster table, since display names carry emoji and invisible characters.
+EXCLUDE_NAMES: tuple[str, ...] = ("Ahmed\u2728\u5b89\u4e4b",)
+EXCLUDE_TAGS: tuple[str, ...] = ()
+
+# Ranked ladder, as it appears in RoyaleAPI's battletype-* row class -- currently
+# "pathOfLegend". Matched as lower-cased substrings, so casing and any _1v1 style
+# suffix are both tolerated; the mode tally after the crawl shows what was on offer.
+RANKED_TYPES = frozenset({"ranked", "pathoflegend", "path_of_legend"})
 
 console = Console()
 
@@ -65,23 +77,55 @@ def pick_session() -> Session:
 
 
 # ---------------------------------------------------------------- roster
-def roster(curl: Curl, seed: str, workers: int) -> tuple[dict[str, dict], dict[str, str], list[str]]:
-    """Every player listed on the seed deck and all its variations."""
+def roster(client: Client, seed: str, floor: int | None = None, show: bool = True,
+           ) -> tuple[dict[str, dict], dict[str, str], list[str]]:
+    """Every player listed on the seed deck and all its variations.
+
+    `floor` given means unattended: apply it instead of asking. `show` prints the
+    roster table, which is noise in a headless run over hundreds of players.
+    """
     with console.status("[cyan]finding deck variations..."):
-        decks = pipeline.similar_decks(curl, seed)
+        decks = pipeline.similar_decks(client, seed)
     console.print(f"[green]{len(decks)} decks[/] (seed + {len(decks) - 1} variations)")
 
-    with _progress(curl.limiter) as prog:
-        t = prog.add_task("rating boards", total=len(decks), **_rate_field(curl.limiter))
+    with _progress(client.limiter) as prog:
+        t = prog.add_task("rating boards", total=len(decks), **_rate_field(client.limiter))
         players, found_on = pipeline.rated_players(
-            curl, decks, workers=workers,
-            tick=lambda: prog.update(t, advance=1, **_rate_field(curl.limiter)),
+            client, decks,
+            tick=lambda: prog.update(t, advance=1, **_rate_field(client.limiter)),
             on_error=lambda d, e: console.print(f"[yellow]skip[/] board {d}: {e}"))
     if not players:
         raise AuthError("no rated players on any of those decks")
 
+    dropped = [t_ for t_, p in players.items() if _excluded(p)]
+    for t_ in dropped:
+        console.print(f"[yellow]excluded[/] {players[t_]['player_name']} [dim]#{t_}[/]")
+        players.pop(t_)
+    if (EXCLUDE_NAMES or EXCLUDE_TAGS) and not dropped:
+        console.print("[yellow]note[/] nothing matched the exclusion list -- if a name looks "
+                      "right in the table below, exclude by tag instead (EXCLUDE_TAGS in "
+                      "royale/ui.py)")
+
+    # Only Ultimate Champion players carry a rating at all -- below UC the ranked
+    # ladder tracks steps -- so this board is already UC-only, and the floor just
+    # picks how far down it you want to go.
+    rated = sorted((int(p["rating"] or 0) for p in players.values()), reverse=True)
+    if rated:
+        console.print(f"[dim]ratings {rated[0]} high, {rated[-1]} low, "
+                      f"median {rated[len(rated) // 2]}[/]")
+    if floor is None:
+        floor = _ask_int("minimum rating (0 = keep every UC player)", 0, lo=0, hi=10_000)
+    if floor:
+        for t_ in [t_ for t_, p in players.items() if int(p["rating"] or 0) < floor]:
+            players.pop(t_)
+        if not players:
+            raise AuthError(f"no players left at rating >= {floor}")
+        console.print(f"[green]{len(players)} players[/] at rating >= {floor}")
+
     # Best players first: the roster is a leaderboard, so read it like one.
     order = sorted(players, key=lambda t_: -int(players[t_]["rating"] or 0))
+    if not show:
+        return players, found_on, order
     seed_cards = set(seed.split(","))
     table = Table("#", "player", "tag", "rating", "wins 7d", "clan", "variation",
                   title=f"{len(order)} players on this archetype")
@@ -93,6 +137,13 @@ def roster(curl: Curl, seed: str, workers: int) -> tuple[dict[str, dict], dict[s
                           c for c in variant.split(",") if c not in seed_cards))
     console.print(table)
     return players, found_on, order
+
+
+def _excluded(p: dict) -> bool:
+    """True for players on the exclusion list, by tag or by exact display name."""
+    tags = {t.lstrip("#").upper() for t in EXCLUDE_TAGS}
+    names = {n.strip().casefold() for n in EXCLUDE_NAMES}
+    return p["player_tag"].lstrip("#").upper() in tags or p["player_name"].strip().casefold() in names
 
 
 # ---------------------------------------------------------------- picker
@@ -171,15 +222,26 @@ def pick_settings(limiter: Limiter) -> int:
     this is the one knob that actually trades speed for risk of being throttled.
     """
     console.print(Panel(
-        f"[bold]parallel requests[/] -- concurrent in-flight fetches, default "
-        f"[cyan]{pipeline.DEFAULT_POOL}[/]\n"
+        f"[bold]batch size[/] -- requests overlapped per round trip, default "
+        f"[cyan]{pipeline.DEFAULT_BATCH}[/]\n"
         f"[bold]rate ceiling[/] -- req/s the limiter won't probe past, default "
         f"[cyan]{limiter.ceiling:.0f}[/]\n"
         "the limiter still self-tunes under this ceiling and still backs off on 429",
         title="settings", border_style="cyan", expand=False))
-    workers = _ask_int("parallel requests", pipeline.DEFAULT_POOL, lo=1, hi=32)
+    batch = _ask_int("batch size", pipeline.DEFAULT_BATCH, lo=1, hi=32)
     limiter.ceiling = _ask_int("rate ceiling (req/s)", int(limiter.ceiling), lo=1, hi=60)
-    return workers
+    return batch
+
+
+def _ask_yes(prompt: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        raw = input(f"{prompt} [{hint}]> ").strip().lower()
+        if not raw:
+            return default
+        if raw in ("y", "yes", "n", "no"):
+            return raw.startswith("y")
+        console.print("[yellow]y or n, or blank for the default[/]")
 
 
 def _ask_int(prompt: str, default: int, lo: int, hi: int) -> int:
@@ -210,69 +272,168 @@ def pick_depth() -> int:
 
 
 # ---------------------------------------------------------------- crawl
-def crawl(curl: Curl, seed: str, players: dict[str, dict],
-          found_on: dict[str, str], max_pages: int, workers: int) -> int:
-    lim = curl.limiter
+GROUP = 25  # players walked, replayed and checkpointed as one unit
+
+
+def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[str, str],
+          max_pages: int, ranked_only: bool = True, group: int = GROUP,
+          outdir: Path = OUTDIR) -> int:
+    """Walk the roster in groups, writing and checkpointing after each one.
+
+    A full-depth crawl of a large roster runs for hours, so nothing is allowed
+    to live only in memory: each group's battles are fetched, replayed, written
+    and recorded before the next group starts. Ctrl-C stops after the group in
+    flight; a crash costs at most that group. Rerunning in the same directory
+    skips finished players outright and any replay already on disk.
+    """
+    lim = client.limiter
     skipped = 0
+    stop = False
 
     def skip(what: str, e: Exception) -> None:
         nonlocal skipped
         skipped += 1
         console.print(f"[yellow]skip[/] {what}: {e}")
 
-    with _progress(lim) as prog:
-        t = prog.add_task("battle history", total=len(players), **_rate_field(lim))
-        rows, dropped = pipeline.battles(
-            curl, players, found_on, seed, max_pages, workers,
-            tick=lambda: prog.update(t, advance=1, **_rate_field(lim)),
-            on_error=lambda tag, e: skip(f"battles {tag}", e))
-    console.print(f"[green]{len(rows)} battles[/] on a seed-deck variation "
-                  f"({dropped} dropped: other decks)")
-    if not rows:
+    def on_sigint(*_):
+        nonlocal stop
+        stop = True
+        console.print("\n[yellow]stopping after this group[/] -- everything written so far is "
+                      "safe; press Ctrl-C again to drop the group in flight")
+
+    pipeline.write_players(outdir, players, found_on)
+    ledger = pipeline.Ledger(outdir)
+    todo = [t for t in players if t not in ledger.done]
+    if len(todo) < len(players):
+        console.print(f"[green]resuming[/] {len(players) - len(todo)} players already finished, "
+                      f"{len(todo)} to go")
+    if not todo:
+        console.print("[green]nothing left to do[/] -- every player in this roster is finished")
         return 0
 
-    with _progress(lim) as prog:
-        t = prog.add_task("replays", total=len(rows), **_rate_field(lim))
-        got = pipeline.replays(
-            curl, rows, workers,
-            tick=lambda: prog.update(t, advance=1, **_rate_field(lim)),
-            on_error=lambda b, e: skip(f"replay {b['replay_tag']}", e))
+    groups = [todo[i:i + group] for i in range(0, len(todo), group)]
+    modes_all: dict[str, int] = {}
+    total = 0
+    prev = signal.signal(signal.SIGINT, on_sigint)
+    try:
+        with pipeline.Sink(outdir) as sink:
+            for gi, tags in enumerate(groups, 1):
+                head = f"group {gi}/{len(groups)}"
+                with console.status(f"[cyan]{head} · walking history for {len(tags)} players..."):
+                    rows, dropped, modes = pipeline.battles(
+                        client, {t: players[t] for t in tags}, found_on, seed, max_pages,
+                        on_error=lambda t, e: skip(f"battles {t}", e),
+                        keep_types=RANKED_TYPES if ranked_only else None)
+                for k, v in modes.items():
+                    modes_all[k] = modes_all.get(k, 0) + v
 
-    battles_csv, plays_csv, n_plays = pipeline.write_csv(OUTDIR, got)
-    table = Table("output", "rows", title=f"done ({skipped} skipped)")
-    table.add_row(str(battles_csv), str(len(got)))
-    table.add_row(str(plays_csv), str(n_plays))
+                # Two players in the same group can appear on both sides of one
+                # battle; fetch it once, from whichever history reached it first.
+                fresh, queued = [], set()
+                for r in rows:
+                    if r["replay_tag"] in sink.done or r["replay_tag"] in queued:
+                        continue
+                    queued.add(r["replay_tag"])
+                    fresh.append(r)
+                with console.status(f"[cyan]{head} · {len(fresh)} replays..."):
+                    got = pipeline.replays(
+                        client, fresh, on_error=lambda b, e: skip(f"replay {b['replay_tag']}", e),
+                        sink=sink)
+                total += got
+                ledger.finish(tags, seed=seed, max_pages=max_pages, ranked_only=ranked_only)
+                # A whole group of replays failing means the login died, not bad luck:
+                # /data/replay is the only gated call, and an expired session fails
+                # every one of them. Stop rather than burn the night writing nothing.
+                if fresh and not got:
+                    console.print(f"[red]{head}: all {len(fresh)} replays failed[/] -- the "
+                                  "RoyaleAPI session has probably expired. Log in again at "
+                                  "https://royaleapi.com and rerun; finished players are "
+                                  "recorded, so it will pick up here.")
+                    break
+                console.print(
+                    f"[green]{head}[/] {len(rows)} kept battles "
+                    f"([dim]{dropped['deck']} other deck, {dropped['mode']} other mode[/]) · "
+                    f"{got} replays · [bold]{sink.battles} battles / {sink.plays} plays[/] "
+                    f"on disk · [dim]{lim}[/]")
+                if stop:
+                    console.print("[yellow]stopped by request[/]")
+                    break
+            written, n_plays = sink.battles, sink.plays
+    finally:
+        signal.signal(signal.SIGINT, prev)
+
+    if modes_all:
+        mt = Table("battle_type", "deck-matching battles", "kept",
+                   title="game modes seen on this deck")
+        for name, n in sorted(modes_all.items(), key=lambda kv: -kv[1]):
+            kept = not ranked_only or any(k in name.lower() for k in RANKED_TYPES)
+            mt.add_row(name, str(n), "[green]yes[/]" if kept else "[dim]no[/]")
+        console.print(mt)
+    if not written and ranked_only and modes_all:
+        console.print("[yellow]nothing kept[/] -- the ranked battle_type is one of the names "
+                      "above; add it to RANKED_TYPES in royale/ui.py")
+
+    table = Table("output", "rows written this run", title=f"done ({skipped} skipped)")
+    table.add_row(str(outdir / "battles.csv"), str(written))
+    table.add_row(str(outdir / "plays.csv"), str(n_plays))
+    table.add_row(str(outdir / "players.csv"), str(len(players)))
     console.print(table)
     console.print(f"[dim]{lim.sent} requests · settled at {lim.rate:.1f}/s · "
                   f"peak {lim.peak:.1f}/s · {lim.hits} x 429[/]")
-    return len(got)
+    return written
 
 
 # ---------------------------------------------------------------- app
+def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int = GROUP,
+         outdir: Path = OUTDIR, ranked_only: bool = True) -> int:
+    """The whole flow with no prompts, for a long unattended run."""
+    console.print(Panel(
+        f"[dim]deck[/] {seed}\n[dim]min rating[/] {min_rating or 'none'}   "
+        f"[dim]pages[/] {max_pages or 'all'}   [dim]group[/] {group}   "
+        f"[dim]ranked only[/] {ranked_only}\n[dim]out[/] {outdir.resolve()}",
+        title="unattended crawl", border_style="cyan", expand=False))
+    session = pick_session()
+    with console.status("[cyan]starting browser, clearing Cloudflare..."):
+        pages = Pages(session)
+    try:
+        client = Client(pages)
+        if not client.logged_in():
+            raise AuthError(f"the {session.browser} session is not logged in to RoyaleAPI")
+        console.print("[green]logged in[/]")
+        players, found_on, order = roster(client, seed, floor=min_rating, show=False)
+        console.print(f"[green]{len(order)} players[/] queued")
+        return crawl(client, seed, players, found_on, max_pages, ranked_only, group, outdir)
+    finally:
+        pages.close()
+
+
 def app(seed: str = SEED) -> int:
     console.print(Panel(
         f"[dim]deck[/] {seed}\n"
         f"[dim]base[/] {', '.join(sorted(parse.base_cards(seed)))}\n"
-        "anonymous browser holds the Cloudflare pass · parallel curl does the work",
+        "the browser holds the Cloudflare pass and issues every request",
         title="RoyaleAPI replay scraper", border_style="cyan", expand=False))
     session = pick_session()
 
-    with console.status("[cyan]starting anonymous browser, clearing Cloudflare..."):
-        pages = Pages()
+    with console.status("[cyan]starting browser, clearing Cloudflare..."):
+        pages = Pages(session)
     try:
-        curl = Curl(pages, session)
+        client = Client(pages)
         with console.status("[cyan]checking login..."):
-            ok = curl.logged_in()
+            ok = client.logged_in()
         if not ok:
             raise AuthError(f"the {session.browser} session is not logged in to RoyaleAPI -- "
                             "log in at https://royaleapi.com/login, then rerun")
         console.print("[green]logged in[/]")
 
-        workers = pick_settings(curl.limiter)
-        players, found_on, order = roster(curl, seed, workers)
+        client.batch = pick_settings(client.limiter)
+        players, found_on, order = roster(client, seed)
         chosen = pick_players(players, order)
         console.print(f"[green]{len(chosen)} player(s)[/] queued")
         max_pages = pick_depth()
-        return crawl(curl, seed, {t: players[t] for t in chosen}, found_on, max_pages, workers)
+        ranked_only = _ask_yes("ranked ladder battles only (skip 2v2, challenges, friendlies)",
+                               default=True)
+        return crawl(client, seed, {t: players[t] for t in chosen}, found_on, max_pages,
+                     ranked_only)
     finally:
         pages.close()

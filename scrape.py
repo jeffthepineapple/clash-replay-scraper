@@ -11,12 +11,13 @@ evolution and hero swaps allowed, no substituted cards. cannon/cannon-ev1 and
 musketeer/musketeer-hero all count as the same deck; swap in a Rocket and the
 battle is dropped.
 
-An anonymous headful Chromium solves the Cloudflare challenge and holds the
-cf_clearance; every fetch then runs in parallel through curl behind a
-self-tuning rate limiter that probes RoyaleAPI's 429 threshold and stays under
-it (royale/limiter.py). The RoyaleAPI session cookie -- lifted from whichever
-local browser you are logged in with, any browser, any OS -- is attached only to
-the login-gated /data/replay calls.
+A headful Chromium solves the Cloudflare challenge and then issues every
+request itself, batched, behind a self-tuning rate limiter that probes
+RoyaleAPI's 429 threshold and stays under it (royale/limiter.py). Cloudflare
+fingerprints the TLS handshake, so an outside HTTP client cannot borrow the
+pass. The RoyaleAPI session cookie -- lifted from whichever local browser you
+are logged in with, any browser, any OS -- rides only in the second browser
+context, the one used for the login-gated /data/replay calls.
 
 Writes battles.csv and plays.csv, joinable on replay_tag.
 """
@@ -28,7 +29,8 @@ import sys
 from royale import parse, pipeline
 from royale.cookies import find_sessions
 from royale.limiter import Limiter
-from royale.transport import AuthError, Curl, Pages
+from royale.transport import AuthError, Client, Pages
+from royale import ui
 from royale.ui import SEED, app, console
 
 
@@ -42,9 +44,9 @@ def selftest() -> None:
                               "musketeer-hero,skeletons-ev1,the-log", SEED)
     assert not parse.is_variation("rocket," + ",".join(SEED.split(",")[1:]), SEED)
 
-    pages = Pages()
+    pages = Pages(sessions[0])
     try:
-        curl = Curl(pages, sessions[0])
+        curl = Client(pages)
         assert curl.logged_in(), f"{sessions[0]} is not logged in"
 
         lim = curl.limiter
@@ -70,18 +72,46 @@ def selftest() -> None:
         assert min(b["battle_timestamp"] for b in paged) \
             < min(b["battle_timestamp"] for b in page1), "later pages are not older"
 
-        rows, dropped = pipeline.battles(curl, one, found_on, SEED, max_pages=3)
+        rows, dropped, modes = pipeline.battles(curl, one, found_on, SEED, max_pages=3)
         assert rows, f"no variation battles for {tag} ({dropped} dropped)"
+        assert modes and sum(modes.values()) == len(rows), (modes, len(rows))
+        # The mode filter must actually bite: keeping a type nothing matches leaves nothing.
+        none_kept, _, _ = pipeline.battles(curl, one, found_on, SEED, max_pages=1,
+                                           keep_types=frozenset({"__nosuchmode__"}))
+        assert not none_kept, "mode filter kept battles it should not have"
         assert all(parse.is_variation(r["team_deck"], SEED) for r in rows), rows[0]["team_deck"]
         assert rows[0]["result"] in {"win", "loss", "draw"}, rows[0]
 
-        got = pipeline.replays(curl, rows[:4])
-        assert len(got) == len(rows[:4]), f"parallel replays dropped some: {len(got)}"
-        stats, plays = got[0][1]
+        # replays() streams into a sink; anything with .write does, so the check
+        # collects in memory instead of touching the caller's CSVs.
+        collected: list[tuple] = []
+
+        class _Collect:
+            @staticmethod
+            def write(b, stats, plays) -> bool:
+                collected.append((b, stats, plays))
+                return True  # a sink returns False only for an already-written tag
+
+        got = pipeline.replays(curl, rows[:4], sink=_Collect())
+        assert got == len(rows[:4]) == len(collected), f"parallel replays dropped some: {got}"
+        _, stats, plays = collected[0]
         assert len(plays) > 10, plays
         assert all(p["side"] in {"blue", "red"} and p["card"] for p in plays), plays[:3]
         assert plays == sorted(plays, key=lambda p: p["tick"]), "timeline not in tick order"
         assert stats["team_elixir_total"] and stats["oppo_elixir_leaked"], stats
+
+        # Placements must reconcile with RoyaleAPI's own count. Each elixir table
+        # reads 'Total <cards> <elixir>', and that card count is exactly the number
+        # of markers carrying coordinates -- hero-ability rows have none by design,
+        # so a selector that silently drops decorated markers shows up right here.
+        for side, key in (("blue", "team_cards"), ("red", "oppo_cards")):
+            placed = [p for p in plays if p["side"] == side and p["x"]]
+            assert str(len(placed)) == stats[key], \
+                f"{side}: parsed {len(placed)} placements, page says {stats[key]}"
+            assert all(0 <= float(p["x"]) <= 18 and 0 <= float(p["y"]) <= 32
+                       for p in placed), "placement off the 18x32 arena"
+        noxy = [p for p in plays if not p["x"]]
+        assert all(p["ability"] == "1" or p["card"] == "_invalid" for p in noxy), noxy[:3]
 
         assert lim.sent > 10, f"limiter saw only {lim.sent} requests"
         assert lim.rate > start or lim.hits, "limiter never ramped up on clean traffic"
@@ -97,15 +127,43 @@ def selftest() -> None:
         pages.close()
     console.print(f"[green]ok[/] {sessions[0]} | {len(decks)} decks, {len(players)} rated players, "
                   f"history {len(page1)} -> {len(paged)} over 3 pages, "
-                  f"{len(rows)} variation battles ({dropped} dropped), "
-                  f"{len(got)} replays in parallel, {len(plays)} card plays\n"
+                  f"{len(rows)} variation battles ({dropped['deck']} dropped), "
+                  f"modes {', '.join(f'{k}={v}' for k, v in sorted(modes.items()))}, "
+                  f"{got} replays in parallel, {len(plays)} card plays "
+                  f"({sum(1 for p in plays if p['x'])} placed)\n"
                   f"[dim]rate: {lim}[/]")
+
+
+def run_unattended(argv: list[str]) -> int:
+    """./scrape.py run [--min-rating N] [--pages N] [--group N] [--out DIR]
+
+    No prompts, so it survives a night in a terminal nobody is watching. Ctrl-C
+    stops after the group in flight; rerunning the same --out resumes.
+    """
+    import argparse
+    from pathlib import Path
+
+    ap = argparse.ArgumentParser(prog="scrape.py run")
+    ap.add_argument("--min-rating", type=int, default=0,
+                    help="drop players rated below this (the board is Ultimate Champion only)")
+    ap.add_argument("--pages", type=int, default=0,
+                    help="history pages per player, 0 walks the whole archive")
+    ap.add_argument("--group", type=int, default=ui.GROUP,
+                    help="players per checkpoint")
+    ap.add_argument("--out", type=Path, default=ui.OUTDIR, help="output directory")
+    ap.add_argument("--all-modes", action="store_true",
+                    help="keep 2v2, challenges and friendlies too")
+    a = ap.parse_args(argv)
+    return ui.auto(SEED, a.min_rating, a.pages, a.group, a.out, not a.all_modes)
 
 
 def main() -> int:
     try:
         if len(sys.argv) > 1 and sys.argv[1] == "selftest":
             selftest()
+            return 0
+        if len(sys.argv) > 1 and sys.argv[1] == "run":
+            run_unattended(sys.argv[2:])
             return 0
         return 0 if app() else 1
     except AuthError as e:
