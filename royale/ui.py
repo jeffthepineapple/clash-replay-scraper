@@ -22,7 +22,7 @@ from rich.table import Table
 from . import parse, pipeline
 from .cookies import Session, find_sessions
 from .limiter import Limiter
-from .transport import AuthError, Curl, Pages
+from .transport import LOGIN_WAIT, AuthError, Curl, Pages
 
 SEED = "cannon-ev1,fireball,hog-rider,ice-golem,ice-spirit,musketeer,skeletons,the-log"
 OUTDIR = Path(".")
@@ -42,13 +42,15 @@ def _rate_field(limiter: Limiter) -> dict:
 
 
 # ---------------------------------------------------------------- session
-def pick_session() -> Session:
-    """Which local browser holds a RoyaleAPI login."""
+def pick_session() -> Session | None:
+    """Which local browser holds a RoyaleAPI login. None: sign in in ours instead."""
     with console.status("[cyan]reading browser cookie jars..."):
         found = find_sessions()
     if not found:
-        raise AuthError("no RoyaleAPI session found in any local browser -- log in at "
-                        "https://royaleapi.com/login, then rerun")
+        console.print("[yellow]no RoyaleAPI session in any local cookie jar[/]\n"
+                      "[dim]Chrome and Edge 127+ on Windows encrypt their jar app-bound: "
+                      "nothing outside the browser can read it.[/]")
+        return None
     if len(found) == 1:
         console.print(f"[green]session[/] {found[0]}")
         return found[0]
@@ -56,12 +58,24 @@ def pick_session() -> Session:
     t = Table("#", "browser", "session", title="RoyaleAPI logins found")
     for i, s in enumerate(found, 1):
         t.add_row(str(i), s.browser, s.value[:12] + "...")
+    t.add_row("s", "this browser", "[dim]sign in now[/]")
     console.print(t)
     while True:
-        raw = console.input("[bold]use which[/] [dim](1)[/] ").strip() or "1"
+        raw = console.input("[bold]use which[/] [dim](1)[/] ").strip().lower() or "1"
+        if raw == "s":
+            return None
         if raw.isdigit() and 1 <= int(raw) <= len(found):
             return found[int(raw) - 1]
-        console.print("[yellow]pick one of the listed numbers[/]")
+        console.print("[yellow]pick one of the listed numbers, or s to sign in[/]")
+
+
+def browser_login(pages: Pages) -> Session:
+    """Sign in inside our own browser and keep the cookie it earns."""
+    console.print("[cyan]sign in to RoyaleAPI in the browser window[/] "
+                  f"[dim](waiting up to {LOGIN_WAIT // 60} min)[/]")
+    session = Session("this browser", pages.login())
+    console.print("[green]signed in[/]")
+    return session
 
 
 # ---------------------------------------------------------------- roster
@@ -260,12 +274,19 @@ def app(seed: str = SEED) -> int:
     with console.status("[cyan]starting anonymous browser, clearing Cloudflare..."):
         pages = Pages()
     try:
-        curl = Curl(pages, session)
-        with console.status("[cyan]checking login..."):
-            ok = curl.logged_in()
-        if not ok:
-            raise AuthError(f"the {session.browser} session is not logged in to RoyaleAPI -- "
-                            "log in at https://royaleapi.com/login, then rerun")
+        curl = Curl(pages, session) if session else None
+        if curl:
+            with console.status("[cyan]checking login..."):
+                ok = curl.logged_in()
+            if not ok:
+                # A jar can hold a cookie RoyaleAPI has since expired.
+                console.print(f"[yellow]the {session.browser} session is not logged in[/]")
+                curl = None
+        if curl is None:
+            curl = Curl(pages, browser_login(pages))
+            with console.status("[cyan]checking login..."):
+                if not curl.logged_in():
+                    raise AuthError("signed in, but RoyaleAPI still refuses the session")
         console.print("[green]logged in[/]")
 
         workers = pick_settings(curl.limiter)

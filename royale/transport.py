@@ -18,9 +18,10 @@ import json
 import os
 import subprocess
 import sys
-from urllib.parse import urlencode
+import time
+from urllib.parse import urlencode, urlsplit
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
 from .cookies import SESSION_COOKIE, Session
 from .limiter import Limiter
@@ -28,6 +29,9 @@ from .limiter import Limiter
 BASE = "https://royaleapi.com"
 SKIP = ("image", "font", "media", "stylesheet")  # nothing we parse needs these
 RETRIES = 6  # per request, all of them 429 backoffs handed to the Limiter
+LOGIN_WAIT = 300  # seconds a human gets to finish signing in
+LANDING = "/me"  # where RoyaleAPI drops you once a login lands
+POLL_EVERY = 1.5  # seconds between "are they in yet?" checks
 
 
 class RateLimited(RuntimeError):
@@ -40,6 +44,10 @@ class ClearanceExpired(RuntimeError):
 
 class AuthError(RuntimeError):
     """Cloudflare or the login gate turned us away for good."""
+
+
+def _is_me(url: str) -> bool:
+    return urlsplit(url).path.rstrip("/") == LANDING
 
 
 class Pages:
@@ -55,8 +63,9 @@ class Pages:
             headless=False, args=["--disable-blink-features=AutomationControlled"])
         self._ctx = self._browser.new_context()
         self.page = self._ctx.new_page()
-        self.page.route("**/*", lambda r: r.abort() if r.request.resource_type in SKIP
-                        else r.continue_())
+        self._route = lambda r: (r.abort() if r.request.resource_type in SKIP
+                                 else r.continue_())
+        self.page.route("**/*", self._route)
         self.ua = self.page.evaluate("navigator.userAgent")
         self.clearance = ""
         self.renew()
@@ -71,12 +80,69 @@ class Pages:
         if self.page.title().startswith("Just a moment"):
             self.page.wait_for_function(
                 "() => !document.title.startsWith('Just a moment')", timeout=60_000)
-        for c in self._ctx.cookies():
-            if c["name"] == "cf_clearance":
-                self.clearance = c["value"]
+        self.clearance = self._cookie("cf_clearance") or self.clearance
         if not self.clearance:
             raise AuthError("browser never got a cf_clearance cookie -- challenge unsolved")
         return self.clearance
+
+    def login(self, timeout: float = LOGIN_WAIT) -> str:
+        """Hand this browser to the human and take the session their login earns.
+
+        The fallback for every jar we cannot read -- Chrome and Edge 127+ on
+        Windows encrypt theirs app-bound, so no outside process gets in. Logging
+        in here also means the session and the Cloudflare pass come from one
+        browser, so they always agree.
+
+        Detection cannot lean on any one step of the login: it may finish in an
+        OAuth popup, in a new tab, or without ever moving this page. So watch
+        for two things -- any tab of ours landing on /me, and /me answering 200
+        to the page's own fetch. The session cookie is no signal at all:
+        anonymous visitors get one too.
+        """
+        self.page.unroute("**/*", self._route)  # the human needs css and images
+        try:
+            self.page.goto(f"{BASE}/login", wait_until="domcontentloaded", timeout=60_000)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if self._landed() or self._authenticated():
+                    value = self._cookie(SESSION_COOKIE)
+                    if value:
+                        # Cloudflare may have rotated the pass while they signed in.
+                        self.clearance = self._cookie("cf_clearance") or self.clearance
+                        return value
+                time.sleep(POLL_EVERY)
+            raise AuthError(f"gave up waiting for the login; last page was {self.page.url}")
+        finally:
+            # A human may well close the tab once signed in; renew() needs one.
+            if self.page.is_closed():
+                self.page = self._ctx.new_page()
+            self.page.route("**/*", self._route)
+
+    def _landed(self) -> bool:
+        """Any tab of ours sitting on /me -- where a finished login drops you."""
+        return any(_is_me(p.url) for p in self._ctx.pages if not p.is_closed())
+
+    def _authenticated(self) -> bool:
+        """Ask /me from inside the page: anonymous callers are sent to /login.
+
+        In-page fetch rather than an API request, so it carries the browser's
+        own headers and Cloudflare state and is not challenged.
+        """
+        try:
+            status = self.page.evaluate(
+                """async () => {
+                    const r = await fetch('/me', {redirect: 'manual'});
+                    return r.type === 'opaqueredirect' ? 302 : r.status;
+                }""")
+        except PlaywrightError:
+            return False  # mid-navigation, or the tab is gone
+        return status == 200
+
+    def _cookie(self, name: str) -> str:
+        for c in self._ctx.cookies():
+            if c["name"] == name and c["value"]:
+                return c["value"]
+        return ""
 
     def close(self) -> None:
         self._browser.close()
