@@ -272,11 +272,11 @@ class Ledger:
     stopped rather than where it started.
     """
 
-    def __init__(self, outdir: Path, name: str = "progress.json"):
+    def __init__(self, outdir: Path, name: str = "progress.json", resume: bool = True):
         self.path = outdir / name
         self.done: set[str] = set()
         self.meta: dict = {}
-        if self.path.exists():
+        if resume and self.path.exists():
             try:
                 blob = json.loads(self.path.read_text())
                 self.done = set(blob.get("players_done", []))

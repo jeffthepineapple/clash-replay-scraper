@@ -153,11 +153,13 @@ def run_unattended(argv: list[str]) -> int:
     ap.add_argument("--out", type=Path, default=ui.OUTDIR, help="output directory")
     ap.add_argument("--all-modes", action="store_true",
                     help="keep 2v2, challenges and friendlies too")
+    ap.add_argument("--refresh", action="store_true",
+                    help="re-walk players already finished, picking up new battles only")
     ap.add_argument("--any-deck", action="store_true",
                     help="keep every deck these players ran, not just seed variations")
     a = ap.parse_args(argv)
     return ui.auto(SEED, a.min_rating, a.pages, a.group, a.out, not a.all_modes,
-                   not a.any_deck)
+                   not a.any_deck, a.refresh)
 
 
 def main() -> int:

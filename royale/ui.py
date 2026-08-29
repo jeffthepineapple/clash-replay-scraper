@@ -277,7 +277,8 @@ GROUP = 25  # players walked, replayed and checkpointed as one unit
 
 def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[str, str],
           max_pages: int, ranked_only: bool = True, group: int = GROUP,
-          outdir: Path = OUTDIR, variations_only: bool = True) -> int:
+          outdir: Path = OUTDIR, variations_only: bool = True,
+          refresh: bool = False) -> int:
     """Walk the roster in groups, writing and checkpointing after each one.
 
     A full-depth crawl of a large roster runs for hours, so nothing is allowed
@@ -308,7 +309,10 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
                       "safe; press Ctrl-C again to stop right now")
 
     pipeline.write_players(outdir, players, found_on)
-    ledger = pipeline.Ledger(outdir)
+    # A refresh re-walks everyone looking for games played since last time. The
+    # Sink still refuses battles already on disk, so only genuinely new ones cost
+    # a replay fetch -- which is what makes a repeating overnight run cheap.
+    ledger = pipeline.Ledger(outdir, resume=not refresh)
     todo = [t for t in players if t not in ledger.done]
     if len(todo) < len(players):
         console.print(f"[green]resuming[/] {len(players) - len(todo)} players already finished, "
@@ -410,14 +414,16 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
 
 # ---------------------------------------------------------------- app
 def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int = GROUP,
-         outdir: Path = OUTDIR, ranked_only: bool = True, variations_only: bool = True) -> int:
+         outdir: Path = OUTDIR, ranked_only: bool = True, variations_only: bool = True,
+         refresh: bool = False) -> int:
     """The whole flow with no prompts, for a long unattended run."""
     console.print(Panel(
         f"[dim]deck[/] {seed}\n[dim]min rating[/] {min_rating or 'none'}   "
         f"[dim]pages[/] {max_pages or 'all'}   [dim]group[/] {group}   "
         f"[dim]ranked only[/] {ranked_only}   "
         f"[dim]decks[/] {'seed variations' if variations_only else 'any'}\n"
-        f"[dim]out[/] {outdir.resolve()}",
+        f"[dim]out[/] {outdir.resolve()}"
+        + ("   [dim]refresh[/] re-walking every player" if refresh else ""),
         title="unattended crawl", border_style="cyan", expand=False))
     session = pick_session()
     with console.status("[cyan]starting browser, clearing Cloudflare..."):
@@ -430,7 +436,7 @@ def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int =
         players, found_on, order = roster(client, seed, floor=min_rating, show=False)
         console.print(f"[green]{len(order)} players[/] queued")
         return crawl(client, seed, players, found_on, max_pages, ranked_only, group, outdir,
-                     variations_only)
+                     variations_only, refresh)
     finally:
         pages.close()
 
