@@ -54,7 +54,12 @@ def selftest() -> None:
 
         decks = pipeline.similar_decks(curl, SEED)
         assert decks[0] == SEED and len(decks) > 1, decks
-        assert all(parse.is_variation(d, SEED) for d in decks), "similar decks are not variations"
+        # /similar lists near neighbours too -- a Knight where the seed runs Ice
+        # Golem, say -- so the roster is a superset of the archetype. Purity comes
+        # from the battle filter, not from this list; most of it should still be
+        # variations, and a board that is not one merely costs a request.
+        variations = [d for d in decks if parse.is_variation(d, SEED)]
+        assert len(variations) >= len(decks) * 0.6, [d for d in decks if d not in variations]
 
         players, found_on = pipeline.rated_players(curl, [SEED])
         assert players, "no rated players"
