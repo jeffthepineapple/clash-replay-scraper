@@ -78,14 +78,16 @@ def pick_session() -> Session:
 
 # ---------------------------------------------------------------- roster
 def roster(client: Client, seed: str, floor: int | None = None, show: bool = True,
+           decks: list[str] | None = None,
            ) -> tuple[dict[str, dict], dict[str, str], list[str]]:
     """Every player listed on the seed deck and all its variations.
 
     `floor` given means unattended: apply it instead of asking. `show` prints the
     roster table, which is noise in a headless run over hundreds of players.
     """
-    with console.status("[cyan]finding deck variations..."):
-        decks = pipeline.similar_decks(client, seed)
+    if decks is None:
+        with console.status("[cyan]finding deck variations..."):
+            decks = pipeline.similar_decks(client, seed)
     console.print(f"[green]{len(decks)} decks[/] (seed + {len(decks) - 1} variations)")
 
     with _progress(client.limiter) as prog:
@@ -277,8 +279,7 @@ GROUP = 25  # players walked, replayed and checkpointed as one unit
 
 def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[str, str],
           max_pages: int, ranked_only: bool = True, group: int = GROUP,
-          outdir: Path = OUTDIR, variations_only: bool = True,
-          refresh: bool = False) -> int:
+          outdir: Path = OUTDIR, keep_deck=None, refresh: bool = False) -> int:
     """Walk the roster in groups, writing and checkpointing after each one.
 
     A full-depth crawl of a large roster runs for hours, so nothing is allowed
@@ -367,7 +368,7 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
                         client, {t: players[t] for t in tags}, found_on, seed, max_pages,
                         on_error=lambda t, e: skip(f"battles {t}", e),
                         keep_types=RANKED_TYPES if ranked_only else None,
-                        on_done=landed, variations_only=variations_only)
+                        on_done=landed, keep_deck=keep_deck)
                 except KeyboardInterrupt:
                     console.print("[yellow]stopped[/]")
                     break
@@ -415,13 +416,23 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
 # ---------------------------------------------------------------- app
 def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int = GROUP,
          outdir: Path = OUTDIR, ranked_only: bool = True, variations_only: bool = True,
-         refresh: bool = False) -> int:
-    """The whole flow with no prompts, for a long unattended run."""
+         refresh: bool = False, card: str = "") -> int:
+    """The whole flow with no prompts, for a long unattended run.
+
+    `card` swaps the archetype definition: instead of one eight-card list and
+    its evo/hero variations, the roster comes from every deck RoyaleAPI lists
+    for that card and a battle counts if it played the card at all.
+    """
+    if card:
+        scope = f"any deck with {card}"
+    elif variations_only:
+        scope = "seed variations"
+    else:
+        scope = "any"
     console.print(Panel(
-        f"[dim]deck[/] {seed}\n[dim]min rating[/] {min_rating or 'none'}   "
+        f"[dim]deck[/] {card or seed}\n[dim]min rating[/] {min_rating or 'none'}   "
         f"[dim]pages[/] {max_pages or 'all'}   [dim]group[/] {group}   "
-        f"[dim]ranked only[/] {ranked_only}   "
-        f"[dim]decks[/] {'seed variations' if variations_only else 'any'}\n"
+        f"[dim]ranked only[/] {ranked_only}   [dim]decks[/] {scope}\n"
         f"[dim]out[/] {outdir.resolve()}"
         + ("   [dim]refresh[/] re-walking every player" if refresh else ""),
         title="unattended crawl", border_style="cyan", expand=False))
@@ -433,10 +444,20 @@ def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int =
         if not client.logged_in():
             raise AuthError(f"the {session.browser} session is not logged in to RoyaleAPI")
         console.print("[green]logged in[/]")
-        players, found_on, order = roster(client, seed, floor=min_rating, show=False)
+        decks = None
+        keep_deck = (lambda d: parse.is_variation(d, seed)) if variations_only else None
+        if card:
+            with console.status(f"[cyan]finding decks that play {card}..."):
+                decks = pipeline.card_decks(client, card)
+            if not decks:
+                raise AuthError(f"RoyaleAPI lists no decks for card {card!r}")
+            console.print(f"[green]{len(decks)} decks[/] play {card}")
+            keep_deck = lambda d: parse.has_card(d, card)
+            seed = decks[0]
+        players, found_on, order = roster(client, seed, floor=min_rating, show=False, decks=decks)
         console.print(f"[green]{len(order)} players[/] queued")
         return crawl(client, seed, players, found_on, max_pages, ranked_only, group, outdir,
-                     variations_only, refresh)
+                     keep_deck, refresh)
     finally:
         pages.close()
 
@@ -468,6 +489,6 @@ def app(seed: str = SEED) -> int:
         ranked_only = _ask_yes("ranked ladder battles only (skip 2v2, challenges, friendlies)",
                                default=True)
         return crawl(client, seed, {t: players[t] for t in chosen}, found_on, max_pages,
-                     ranked_only)
+                     ranked_only, keep_deck=lambda d: parse.is_variation(d, seed))
     finally:
         pages.close()

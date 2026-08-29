@@ -144,6 +144,12 @@ def run_unattended(argv: list[str]) -> int:
     from pathlib import Path
 
     ap = argparse.ArgumentParser(prog="scrape.py run")
+    ap.add_argument("--deck", default=SEED,
+                    help="seed deck as comma-separated card slugs; evo cards end -ev1, "
+                         "champions/heroes -hero. Defaults to the Hog 2.6 seed.")
+    ap.add_argument("--card", default="",
+                    help="crawl every deck built around this card (e.g. golem) instead of "
+                         "one fixed list; overrides --deck")
     ap.add_argument("--min-rating", type=int, default=0,
                     help="drop players rated below this (the board is Ultimate Champion only)")
     ap.add_argument("--pages", type=int, default=0,
@@ -158,8 +164,8 @@ def run_unattended(argv: list[str]) -> int:
     ap.add_argument("--any-deck", action="store_true",
                     help="keep every deck these players ran, not just seed variations")
     a = ap.parse_args(argv)
-    return ui.auto(SEED, a.min_rating, a.pages, a.group, a.out, not a.all_modes,
-                   not a.any_deck, a.refresh)
+    return ui.auto(a.deck, a.min_rating, a.pages, a.group, a.out, not a.all_modes,
+                   not a.any_deck, a.refresh, a.card)
 
 
 def main() -> int:

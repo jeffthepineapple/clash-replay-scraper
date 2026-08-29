@@ -44,6 +44,12 @@ def similar_decks(client: Client, seed: str, limit: int = 25) -> list[str]:
     return parse.similar_decks(client.get(f"/decks/stats/{seed}/similar"), seed)[:limit]
 
 
+def card_decks(client: Client, card: str, limit: int = 40) -> list[str]:
+    """Every deck RoyaleAPI lists for a card -- the roster source for crawling an
+    archetype defined by one card rather than by a fixed eight."""
+    return parse.decks_with_card(client.get(f"/card/{card}"), card)[:limit]
+
+
 def rated_players(client: Client, decks: Iterable[str], per_deck: int | None = None,
                   tick: Tick = _noop, on_error=None,
                   ) -> tuple[dict[str, dict], dict[str, str]]:
@@ -102,7 +108,7 @@ def player_battles(client: Client, tag: str, max_pages: int = 0,
 def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], seed: str,
             max_pages: int = 0, tick: Tick = _noop, on_error=None,
             keep_types: frozenset[str] | None = None, on_done=None,
-            variations_only: bool = True,
+            keep_deck: "Callable[[str], bool] | None" = None,
             ) -> tuple[list[dict], dict[str, int], dict[str, int]]:
     """Battle rows for every player, keeping only games played on a variation of
     `seed` -- same base cards, evo/hero swaps allowed, no substituted cards.
@@ -112,8 +118,8 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
     that round as one batch. Slow players stay in the rotation until their
     archive runs out; finished ones drop out and tick the progress bar.
 
-    variations_only=False drops the deck filter and keeps every battle these
-    players fought, still subject to keep_types.
+    keep_deck(team_deck) decides which battles are the archetype; None keeps
+    every battle these players fought, still subject to keep_types.
 
     keep_types narrows further to game modes: a battle survives when its
     battle_type contains any of these substrings. None keeps every mode.
@@ -146,10 +152,11 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
         """
         kept = []
         for b in walk[tag]["rows"]:
-            # variations_only=False keeps whatever else these players ran. The
-            # history pages are already paid for, so the only extra cost is the
-            # replay fetch, and team_deck still says what was played.
-            if variations_only and not parse.is_variation(b["team_deck"], seed):
+            # keep_deck decides what counts as the archetype: an exact card set
+            # for a fixed list, a single card for a family of them, or None to
+            # keep whatever these players ran. The history pages are paid for
+            # either way, so a looser test only costs the extra replay fetches.
+            if keep_deck and not keep_deck(b["team_deck"]):
                 dropped["deck"] += 1
                 continue
             bt = b["battle_type"] or "?"

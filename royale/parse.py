@@ -27,6 +27,22 @@ def is_variation(deck: str, seed: str) -> bool:
     return base_cards(deck) == base_cards(seed)
 
 
+def has_card(deck: str, card: str) -> bool:
+    """True if deck plays `card`, whatever evolution or hero form it is in."""
+    return VARIANT.sub("", card) in base_cards(deck)
+
+
+def decks_with_card(html: str, card: str) -> list[str]:
+    """Deck slugs linked from a /card/<name> page that actually play that card.
+
+    The page links plenty of decks; this keeps the ones the card appears in, so
+    an archetype can be crawled as "whatever people build around X" rather than
+    as one fixed eight-card list.
+    """
+    found = dict.fromkeys(re.findall(r"/decks/stats/([a-z0-9,\-]+)", html))
+    return [d for d in found if has_card(d, card)]
+
+
 def similar_decks(html: str, seed: str) -> list[str]:
     """Deck slugs linked from a /similar page, seed first, order preserved."""
     found = dict.fromkeys(re.findall(r"/decks/stats/([a-z0-9,\-]+)/similar", html))
