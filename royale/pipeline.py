@@ -315,7 +315,10 @@ class Sink:
         self.battles_csv = outdir / "battles.csv"
         self.plays_csv = outdir / "plays.csv"
         self.done: set[str] = set()
-        append = resume and self.battles_csv.exists() and self.plays_csv.exists()
+        # An empty file is a run that died before writing anything, not a resume:
+        # appending to it would skip the header and leave headerless CSVs.
+        append = resume and all(f.exists() and f.stat().st_size > 0
+                                for f in (self.battles_csv, self.plays_csv))
         if append:
             with self.battles_csv.open(newline="") as f:
                 self.done = {r["replay_tag"] for r in csv.DictReader(f) if r.get("replay_tag")}
