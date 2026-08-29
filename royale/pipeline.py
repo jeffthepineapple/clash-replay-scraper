@@ -96,7 +96,7 @@ def player_battles(client: Client, tag: str, max_pages: int = 0,
 
 def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], seed: str,
             max_pages: int = 0, tick: Tick = _noop, on_error=None,
-            keep_types: frozenset[str] | None = None,
+            keep_types: frozenset[str] | None = None, on_done=None,
             ) -> tuple[list[dict], dict[str, int], dict[str, int]]:
     """Battle rows for every player, keeping only games played on a variation of
     `seed` -- same base cards, evo/hero swaps allowed, no substituted cards.
@@ -111,6 +111,10 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
     Substring, not equality, because RoyaleAPI's battletype-* class names carry
     suffixes (ranked_1v1, pathoflegend_1v1, ...) that shift between seasons.
 
+    on_done(tag, kept) fires as each player's archive runs out, so a long crawl
+    can replay and write that player straight away instead of holding hours of
+    history in memory. An interrupt harvests the players still in flight.
+
     Returns (rows, dropped, modes) -- dropped counts what each filter removed,
     modes tallies the battle_type of every deck-matching battle seen, so the
     caller can show what the mode filter is actually choosing between.
@@ -118,6 +122,35 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
     walk = {t: {"path": f"/player/{t}/battles/history", "rows": [], "seen": set(), "page": 0}
             for t in players}
     active = list(walk)
+    rows: list[dict] = []
+    dropped = {"deck": 0, "mode": 0}
+    modes: dict[str, int] = {}
+
+    def harvest(tag: str) -> None:
+        """Filter one finished player's history and hand it straight on.
+
+        Called the moment that player's archive runs out rather than after the
+        whole wave, so a caller can replay and write it immediately. On a deep
+        archive the difference is rows on disk within minutes instead of after
+        every player in the wave has been walked.
+        """
+        kept = []
+        for b in walk[tag]["rows"]:
+            if not parse.is_variation(b["team_deck"], seed):
+                dropped["deck"] += 1
+                continue
+            bt = b["battle_type"] or "?"
+            modes[bt] = modes.get(bt, 0) + 1
+            # RoyaleAPI's class names are camelCase (pathOfLegend); match case-blind
+            # so a season's rename of the casing cannot silently empty the crawl.
+            if keep_types is not None and not any(k in bt.lower() for k in keep_types):
+                dropped["mode"] += 1
+                continue
+            kept.append({"deck": found_on.get(tag, seed), **players[tag], **b})
+        rows.extend(kept)
+        walk[tag]["rows"] = []  # handed over; do not hold the raw history in memory
+        if on_done:
+            on_done(tag, kept)
 
     try:
         while active:
@@ -142,27 +175,12 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
                     w["path"] = nxt
                     still.append(tag)
                 else:
-                    tick()  # this player's archive is done
+                    harvest(tag)  # this player's archive is done
+                    tick()
             active = still
     except KeyboardInterrupt:
-        pass  # keep everything already fetched
-
-    rows: list[dict] = []
-    dropped = {"deck": 0, "mode": 0}
-    modes: dict[str, int] = {}
-    for tag, w in walk.items():
-        for b in w["rows"]:
-            if not parse.is_variation(b["team_deck"], seed):
-                dropped["deck"] += 1
-                continue
-            bt = b["battle_type"] or "?"
-            modes[bt] = modes.get(bt, 0) + 1
-            # RoyaleAPI's class names are camelCase (pathOfLegend); match case-blind
-            # so a season's rename of the casing cannot silently empty the crawl.
-            if keep_types is not None and not any(k in bt.lower() for k in keep_types):
-                dropped["mode"] += 1
-                continue
-            rows.append({"deck": found_on.get(tag, seed), **players[tag], **b})
+        for tag in active:      # partial histories are still worth keeping
+            harvest(tag)
     return rows, dropped, modes
 
 

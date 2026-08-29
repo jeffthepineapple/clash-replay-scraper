@@ -317,44 +317,56 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
     prev = signal.signal(signal.SIGINT, on_sigint)
     try:
         with pipeline.Sink(outdir) as sink:
-            for gi, tags in enumerate(groups, 1):
-                head = f"group {gi}/{len(groups)}"
-                with console.status(f"[cyan]{head} · walking history for {len(tags)} players..."):
-                    rows, dropped, modes = pipeline.battles(
-                        client, {t: players[t] for t in tags}, found_on, seed, max_pages,
-                        on_error=lambda t, e: skip(f"battles {t}", e),
-                        keep_types=RANKED_TYPES if ranked_only else None)
-                for k, v in modes.items():
-                    modes_all[k] = modes_all.get(k, 0) + v
+            dead_logins = 0
 
-                # Two players in the same group can appear on both sides of one
-                # battle; fetch it once, from whichever history reached it first.
+            def landed(tag: str, kept: list[dict]) -> None:
+                """One player's archive is done: replay and write it now.
+
+                Doing this per player rather than per wave is what keeps a
+                deep-archive crawl honest -- rows reach disk continuously, and the
+                log gains a line per player instead of going quiet for an hour.
+                """
+                nonlocal total, dead_logins
+                # A battle between two roster players is reached from both
+                # histories; fetch it once, from whichever got there first.
                 fresh, queued = [], set()
-                for r in rows:
+                for r in kept:
                     if r["replay_tag"] in sink.done or r["replay_tag"] in queued:
                         continue
                     queued.add(r["replay_tag"])
                     fresh.append(r)
-                with console.status(f"[cyan]{head} · {len(fresh)} replays..."):
-                    got = pipeline.replays(
-                        client, fresh, on_error=lambda b, e: skip(f"replay {b['replay_tag']}", e),
-                        sink=sink)
+                got = pipeline.replays(
+                    client, fresh, on_error=lambda b, e: skip(f"replay {b['replay_tag']}", e),
+                    sink=sink)
                 total += got
-                ledger.finish(tags, seed=seed, max_pages=max_pages, ranked_only=ranked_only)
-                # A whole group of replays failing means the login died, not bad luck:
-                # /data/replay is the only gated call, and an expired session fails
-                # every one of them. Stop rather than burn the night writing nothing.
-                if fresh and not got:
-                    console.print(f"[red]{head}: all {len(fresh)} replays failed[/] -- the "
+                ledger.finish([tag], seed=seed, max_pages=max_pages, ranked_only=ranked_only)
+                dead_logins = dead_logins + 1 if (fresh and not got) else 0
+                console.print(
+                    f"[green]{players[tag]['player_name'][:20]}[/] [dim]#{tag}[/] "
+                    f"r{players[tag]['rating']} · {len(kept)} kept · {got} replays · "
+                    f"[bold]{sink.battles} battles / {sink.plays} plays[/] · [dim]{lim}[/]")
+
+            for gi, tags in enumerate(groups, 1):
+                head = f"group {gi}/{len(groups)}"
+                console.print(f"[cyan]{head}[/] walking {len(tags)} players")
+                rows, dropped, modes = pipeline.battles(
+                    client, {t: players[t] for t in tags}, found_on, seed, max_pages,
+                    on_error=lambda t, e: skip(f"battles {t}", e),
+                    keep_types=RANKED_TYPES if ranked_only else None,
+                    on_done=landed)
+                for k, v in modes.items():
+                    modes_all[k] = modes_all.get(k, 0) + v
+                console.print(f"[dim]{head} done · {dropped['deck']} other deck, "
+                              f"{dropped['mode']} other mode[/]")
+                # Consecutive players whose every replay failed means the login died,
+                # not bad luck: /data/replay is the only gated call, and an expired
+                # session fails all of them. Stop rather than burn the night.
+                if dead_logins >= 3:
+                    console.print("[red]three players in a row had every replay fail[/] -- the "
                                   "RoyaleAPI session has probably expired. Log in again at "
                                   "https://royaleapi.com and rerun; finished players are "
-                                  "recorded, so it will pick up here.")
+                                  "recorded, so it picks up here.")
                     break
-                console.print(
-                    f"[green]{head}[/] {len(rows)} kept battles "
-                    f"([dim]{dropped['deck']} other deck, {dropped['mode']} other mode[/]) · "
-                    f"{got} replays · [bold]{sink.battles} battles / {sink.plays} plays[/] "
-                    f"on disk · [dim]{lim}[/]")
                 if stop:
                     console.print("[yellow]stopped by request[/]")
                     break
