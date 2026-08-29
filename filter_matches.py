@@ -10,6 +10,9 @@ re-scraping. Two rules, both aimed at a player who was not really playing:
             a real game sits near 5 (p95 is 18).
   fast3     someone took three crowns within 90 seconds. A genuine 3-0 that
             fast does not happen against an opponent who is defending.
+  empty     the replay carried no timeline at all. Old battles keep their row
+            in the history long after RoyaleAPI drops the replay itself, so
+            these arrive as a battle with zero card plays and no elixir table.
 
 Usage:  ./filter_matches.py data/run1 [--leak 100] [--secs 90]
 Writes battles.clean.csv / plays.clean.csv and battles.flagged.csv.
@@ -48,10 +51,16 @@ def main() -> None:
         if t > last[p["replay_tag"]]:
             last[p["replay_tag"]] = t
 
+    played: dict[str, int] = defaultdict(int)
+    for p in plays:
+        played[p["replay_tag"]] += 1
+
     flagged: dict[str, list[str]] = {}
     for b in battles:
         tag = b["replay_tag"]
         why = []
+        if not played[tag]:
+            why.append("empty")
         if max(num(b["team_elixir_leaked"]), num(b["oppo_elixir_leaked"])) >= a.leak:
             why.append("leak")
         crowns = max(num(b["team_crowns"]), num(b["opponent_crowns"]))
