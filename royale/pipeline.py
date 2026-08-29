@@ -97,6 +97,7 @@ def player_battles(client: Client, tag: str, max_pages: int = 0,
 def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], seed: str,
             max_pages: int = 0, tick: Tick = _noop, on_error=None,
             keep_types: frozenset[str] | None = None, on_done=None,
+            variations_only: bool = True,
             ) -> tuple[list[dict], dict[str, int], dict[str, int]]:
     """Battle rows for every player, keeping only games played on a variation of
     `seed` -- same base cards, evo/hero swaps allowed, no substituted cards.
@@ -105,6 +106,9 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
     independent, so this advances every player by one page per round and fetches
     that round as one batch. Slow players stay in the rotation until their
     archive runs out; finished ones drop out and tick the progress bar.
+
+    variations_only=False drops the deck filter and keeps every battle these
+    players fought, still subject to keep_types.
 
     keep_types narrows further to game modes: a battle survives when its
     battle_type contains any of these substrings. None keeps every mode.
@@ -136,7 +140,10 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
         """
         kept = []
         for b in walk[tag]["rows"]:
-            if not parse.is_variation(b["team_deck"], seed):
+            # variations_only=False keeps whatever else these players ran. The
+            # history pages are already paid for, so the only extra cost is the
+            # replay fetch, and team_deck still says what was played.
+            if variations_only and not parse.is_variation(b["team_deck"], seed):
                 dropped["deck"] += 1
                 continue
             bt = b["battle_type"] or "?"

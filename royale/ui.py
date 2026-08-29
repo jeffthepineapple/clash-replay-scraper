@@ -277,7 +277,7 @@ GROUP = 25  # players walked, replayed and checkpointed as one unit
 
 def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[str, str],
           max_pages: int, ranked_only: bool = True, group: int = GROUP,
-          outdir: Path = OUTDIR) -> int:
+          outdir: Path = OUTDIR, variations_only: bool = True) -> int:
     """Walk the roster in groups, writing and checkpointing after each one.
 
     A full-depth crawl of a large roster runs for hours, so nothing is allowed
@@ -363,7 +363,7 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
                         client, {t: players[t] for t in tags}, found_on, seed, max_pages,
                         on_error=lambda t, e: skip(f"battles {t}", e),
                         keep_types=RANKED_TYPES if ranked_only else None,
-                        on_done=landed)
+                        on_done=landed, variations_only=variations_only)
                 except KeyboardInterrupt:
                     console.print("[yellow]stopped[/]")
                     break
@@ -410,12 +410,14 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
 
 # ---------------------------------------------------------------- app
 def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int = GROUP,
-         outdir: Path = OUTDIR, ranked_only: bool = True) -> int:
+         outdir: Path = OUTDIR, ranked_only: bool = True, variations_only: bool = True) -> int:
     """The whole flow with no prompts, for a long unattended run."""
     console.print(Panel(
         f"[dim]deck[/] {seed}\n[dim]min rating[/] {min_rating or 'none'}   "
         f"[dim]pages[/] {max_pages or 'all'}   [dim]group[/] {group}   "
-        f"[dim]ranked only[/] {ranked_only}\n[dim]out[/] {outdir.resolve()}",
+        f"[dim]ranked only[/] {ranked_only}   "
+        f"[dim]decks[/] {'seed variations' if variations_only else 'any'}\n"
+        f"[dim]out[/] {outdir.resolve()}",
         title="unattended crawl", border_style="cyan", expand=False))
     session = pick_session()
     with console.status("[cyan]starting browser, clearing Cloudflare..."):
@@ -427,7 +429,8 @@ def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int =
         console.print("[green]logged in[/]")
         players, found_on, order = roster(client, seed, floor=min_rating, show=False)
         console.print(f"[green]{len(order)} players[/] queued")
-        return crawl(client, seed, players, found_on, max_pages, ranked_only, group, outdir)
+        return crawl(client, seed, players, found_on, max_pages, ranked_only, group, outdir,
+                     variations_only)
     finally:
         pages.close()
 
