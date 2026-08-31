@@ -153,8 +153,12 @@ def run_unattended(argv: list[str]) -> int:
                     help="seed deck as comma-separated card slugs; evo cards end -ev1, "
                          "champions/heroes -hero. Defaults to the Hog 2.6 seed.")
     ap.add_argument("--card", default="",
-                    help="crawl every deck built around this card (e.g. golem) instead of "
-                         "one fixed list; overrides --deck")
+                    help="crawl every deck built around this card signature instead of one "
+                         "fixed list, e.g. golem or pekka,battle-ram (all must be present); "
+                         "overrides --deck")
+    ap.add_argument("--shard", default="",
+                    help="split the roster across miners as i/n, e.g. 0/3. Each miner takes a "
+                         "disjoint set of players, so nobody crawls the same history twice.")
     ap.add_argument("--min-rating", type=int, default=0,
                     help="drop players rated below this (the board is Ultimate Champion only)")
     ap.add_argument("--pages", type=int, default=0,
@@ -169,8 +173,14 @@ def run_unattended(argv: list[str]) -> int:
     ap.add_argument("--any-deck", action="store_true",
                     help="keep every deck these players ran, not just seed variations")
     a = ap.parse_args(argv)
+    shard = None
+    if a.shard:
+        i, _, n = a.shard.partition("/")
+        if not (i.isdigit() and n.isdigit()) or not 0 <= int(i) < int(n):
+            ap.error("--shard must look like i/n with 0 <= i < n, e.g. 0/3")
+        shard = (int(i), int(n))
     return ui.auto(a.deck, a.min_rating, a.pages, a.group, a.out, not a.all_modes,
-                   not a.any_deck, a.refresh, a.card)
+                   not a.any_deck, a.refresh, a.card, shard)
 
 
 def main() -> int:

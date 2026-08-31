@@ -11,6 +11,7 @@ the end of the progress bar.
 
 from __future__ import annotations
 
+import hashlib
 import readline
 import signal
 from pathlib import Path
@@ -139,6 +140,16 @@ def roster(client: Client, seed: str, floor: int | None = None, show: bool = Tru
                           c for c in variant.split(",") if c not in seed_cards))
     console.print(table)
     return players, found_on, order
+
+
+def shard_of(tag: str, n: int) -> int:
+    """Which of `n` miners owns this player.
+
+    Hashed rather than sliced off the roster order, so every miner agrees on the
+    split without coordinating and the answer does not move when RoyaleAPI
+    reorders its boards or a rating changes.
+    """
+    return int(hashlib.sha1(tag.encode()).hexdigest(), 16) % n
 
 
 def _excluded(p: dict) -> bool:
@@ -416,7 +427,7 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
 # ---------------------------------------------------------------- app
 def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int = GROUP,
          outdir: Path = OUTDIR, ranked_only: bool = True, variations_only: bool = True,
-         refresh: bool = False, card: str = "") -> int:
+         refresh: bool = False, card: str = "", shard: tuple[int, int] | None = None) -> int:
     """The whole flow with no prompts, for a long unattended run.
 
     `card` swaps the archetype definition: instead of one eight-card list and
@@ -434,6 +445,7 @@ def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int =
         f"[dim]pages[/] {max_pages or 'all'}   [dim]group[/] {group}   "
         f"[dim]ranked only[/] {ranked_only}   [dim]decks[/] {scope}\n"
         f"[dim]out[/] {outdir.resolve()}"
+        + (f"   [dim]shard[/] {shard[0]} of {shard[1]}" if shard else "")
         + ("   [dim]refresh[/] re-walking every player" if refresh else ""),
         title="unattended crawl", border_style="cyan", expand=False))
     session = pick_session()
@@ -447,14 +459,23 @@ def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int =
         decks = None
         keep_deck = (lambda d: parse.is_variation(d, seed)) if variations_only else None
         if card:
-            with console.status(f"[cyan]finding decks that play {card}..."):
-                decks = pipeline.card_decks(client, card)
+            cards = [c.strip() for c in card.split(",") if c.strip()]
+            with console.status(f"[cyan]finding decks that play {' + '.join(cards)}..."):
+                decks = pipeline.card_decks(client, cards)
             if not decks:
-                raise AuthError(f"RoyaleAPI lists no decks for card {card!r}")
-            console.print(f"[green]{len(decks)} decks[/] play {card}")
-            keep_deck = lambda d: parse.has_card(d, card)
+                raise AuthError(f"RoyaleAPI lists no decks playing {' + '.join(cards)}")
+            console.print(f"[green]{len(decks)} decks[/] play {' + '.join(cards)}")
+            keep_deck = lambda d: parse.has_cards(d, cards)
             seed = decks[0]
         players, found_on, order = roster(client, seed, floor=min_rating, show=False, decks=decks)
+        if shard:
+            i, n = shard
+            mine = [t for t in order if shard_of(t, n) == i]
+            console.print(f"[green]shard {i}/{n}[/] takes {len(mine)} of {len(order)} players")
+            players = {t: players[t] for t in mine}
+            order = mine
+            if not order:
+                raise AuthError(f"shard {i} of {n} is empty for this roster")
         console.print(f"[green]{len(order)} players[/] queued")
         return crawl(client, seed, players, found_on, max_pages, ranked_only, group, outdir,
                      keep_deck, refresh)

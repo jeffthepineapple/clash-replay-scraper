@@ -7,6 +7,7 @@ transport already knows how to fetch.
 from __future__ import annotations
 
 import re
+from typing import Iterable
 
 from bs4 import BeautifulSoup
 
@@ -32,15 +33,25 @@ def has_card(deck: str, card: str) -> bool:
     return VARIANT.sub("", card) in base_cards(deck)
 
 
-def decks_with_card(html: str, card: str) -> list[str]:
-    """Deck slugs linked from a /card/<name> page that actually play that card.
+def has_cards(deck: str, cards: Iterable[str]) -> bool:
+    """True if deck plays every one of `cards`, in any evolution or hero form.
 
-    The page links plenty of decks; this keeps the ones the card appears in, so
-    an archetype can be crawled as "whatever people build around X" rather than
-    as one fixed eight-card list.
+    An archetype is often a pair rather than a single card -- PEKKA bridge spam
+    is PEKKA *and* Battle Ram; either alone is a different deck.
     """
+    return all(has_card(deck, c) for c in cards)
+
+
+def decks_with_cards(html: str, cards: Iterable[str]) -> list[str]:
+    """Deck slugs linked from a /card/<name> page that play all of `cards`.
+
+    The page links plenty of decks; this keeps the ones matching the whole
+    signature, so an archetype can be crawled as "whatever people build around
+    these" rather than as one fixed eight-card list.
+    """
+    cards = list(cards)
     found = dict.fromkeys(re.findall(r"/decks/stats/([a-z0-9,\-]+)", html))
-    return [d for d in found if has_card(d, card)]
+    return [d for d in found if has_cards(d, cards)]
 
 
 def similar_decks(html: str, seed: str) -> list[str]:

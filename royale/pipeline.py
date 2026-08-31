@@ -44,10 +44,16 @@ def similar_decks(client: Client, seed: str, limit: int = 25) -> list[str]:
     return parse.similar_decks(client.get(f"/decks/stats/{seed}/similar"), seed)[:limit]
 
 
-def card_decks(client: Client, card: str, limit: int = 40) -> list[str]:
-    """Every deck RoyaleAPI lists for a card -- the roster source for crawling an
-    archetype defined by one card rather than by a fixed eight."""
-    return parse.decks_with_card(client.get(f"/card/{card}"), card)[:limit]
+def card_decks(client: Client, cards: list[str], limit: int = 40) -> list[str]:
+    """Decks RoyaleAPI lists for the rarest-looking of `cards` that play all of
+    them -- the roster source for an archetype defined by a card signature
+    rather than by a fixed eight.
+
+    Only one card page is fetched: any deck playing the whole signature is
+    listed on every member's page, so the others would add nothing.
+    """
+    html = client.get(f"/card/{cards[0]}")
+    return parse.decks_with_cards(html, cards)[:limit]
 
 
 def rated_players(client: Client, decks: Iterable[str], per_deck: int | None = None,
