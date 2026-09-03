@@ -13,6 +13,9 @@ re-scraping. Two rules, both aimed at a player who was not really playing:
   empty     the replay carried no timeline at all. Old battles keep their row
             in the history long after RoyaleAPI drops the replay itself, so
             these arrive as a battle with zero card plays and no elixir table.
+  card      either side played a banned card (--exclude-card). Matched in exact
+            evolution form, so banning elite-barbarians-ev1 leaves plain
+            elite-barbarians alone.
 
 Usage:  ./filter_matches.py data/run1 [--leak 100] [--secs 90]
 Writes battles.clean.csv / plays.clean.csv and battles.flagged.csv.
@@ -39,6 +42,9 @@ def main() -> None:
     ap.add_argument("outdir", type=Path)
     ap.add_argument("--leak", type=float, default=100.0, help="elixir leaked by either side")
     ap.add_argument("--secs", type=float, default=90.0, help="a 3-crown inside this is suspect")
+    ap.add_argument("--exclude-card", default="",
+                    help="comma-separated card slugs; a battle where either side played one "
+                         "is dropped, e.g. elite-barbarians-ev1")
     a = ap.parse_args()
 
     battles = list(csv.DictReader((a.outdir / "battles.csv").open()))
@@ -55,10 +61,15 @@ def main() -> None:
     for p in plays:
         played[p["replay_tag"]] += 1
 
+    banned = [c.strip() for c in a.exclude_card.split(",") if c.strip()]
+
     flagged: dict[str, list[str]] = {}
     for b in battles:
         tag = b["replay_tag"]
         why = []
+        if banned and any(c in b["team_deck"].split(",") or c in b["opponent_deck"].split(",")
+                          for c in banned):
+            why.append("card")
         if not played[tag]:
             why.append("empty")
         if max(num(b["team_elixir_leaked"]), num(b["oppo_elixir_leaked"])) >= a.leak:

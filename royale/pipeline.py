@@ -115,6 +115,7 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
             max_pages: int = 0, tick: Tick = _noop, on_error=None,
             keep_types: frozenset[str] | None = None, on_done=None,
             keep_deck: "Callable[[str], bool] | None" = None,
+            reject: "Callable[[dict], bool] | None" = None,
             ) -> tuple[list[dict], dict[str, int], dict[str, int]]:
     """Battle rows for every player, keeping only games played on a variation of
     `seed` -- same base cards, evo/hero swaps allowed, no substituted cards.
@@ -126,6 +127,8 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
 
     keep_deck(team_deck) decides which battles are the archetype; None keeps
     every battle these players fought, still subject to keep_types.
+
+    reject(battle) vetoes a battle outright, looking at either side's deck.
 
     keep_types narrows further to game modes: a battle survives when its
     battle_type contains any of these substrings. None keeps every mode.
@@ -145,7 +148,7 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
             for t in players}
     active = list(walk)
     rows: list[dict] = []
-    dropped = {"deck": 0, "mode": 0}
+    dropped = {"deck": 0, "mode": 0, "card": 0}
     modes: dict[str, int] = {}
 
     def harvest(tag: str) -> None:
@@ -164,6 +167,12 @@ def battles(client: Client, players: dict[str, dict], found_on: dict[str, str], 
             # either way, so a looser test only costs the extra replay fetches.
             if keep_deck and not keep_deck(b["team_deck"]):
                 dropped["deck"] += 1
+                continue
+            # reject() sees the whole battle, so it can veto on the opponent's
+            # deck as well as the player's -- a banned card poisons the match
+            # whichever side brought it.
+            if reject and reject(b):
+                dropped["card"] += 1
                 continue
             bt = b["battle_type"] or "?"
             modes[bt] = modes.get(bt, 0) + 1

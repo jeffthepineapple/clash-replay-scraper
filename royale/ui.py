@@ -35,6 +35,11 @@ OUTDIR = Path(".")
 EXCLUDE_NAMES: tuple[str, ...] = ("Ahmed\u2728\u5b89\u4e4b",)
 EXCLUDE_TAGS: tuple[str, ...] = ()
 
+# Cards banned outright: a battle is dropped when either side played one, since
+# a banned card shapes the match whoever brought it. Matched in exact evolution
+# form, so plain elite-barbarians is unaffected by banning elite-barbarians-ev1.
+EXCLUDE_CARDS: tuple[str, ...] = ("elite-barbarians-ev1",)
+
 # Ranked ladder, as it appears in RoyaleAPI's battletype-* row class -- currently
 # "pathOfLegend". Matched as lower-cased substrings, so casing and any _1v1 style
 # suffix are both tolerated; the mode tally after the crawl shows what was on offer.
@@ -143,6 +148,14 @@ def roster(client: Client, seed: str, floor: int | None = None, show: bool = Tru
                           c for c in variant.split(",") if c not in seed_cards))
     console.print(table)
     return players, found_on, order
+
+
+def _rejector(cards: tuple[str, ...]):
+    """A veto over whole battles: either deck playing a banned card drops it."""
+    if not cards:
+        return None
+    return lambda b: any(parse.plays_exact(b["team_deck"], c)
+                         or parse.plays_exact(b["opponent_deck"], c) for c in cards)
 
 
 def shard_of(tag: str, n: int) -> int:
@@ -293,7 +306,8 @@ GROUP = 25  # players walked, replayed and checkpointed as one unit
 
 def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[str, str],
           max_pages: int, ranked_only: bool = True, group: int = GROUP,
-          outdir: Path = OUTDIR, keep_deck=None, refresh: bool = False) -> int:
+          outdir: Path = OUTDIR, keep_deck=None, refresh: bool = False,
+          exclude_cards: tuple[str, ...] = EXCLUDE_CARDS) -> int:
     """Walk the roster in groups, writing and checkpointing after each one.
 
     A full-depth crawl of a large roster runs for hours, so nothing is allowed
@@ -382,14 +396,16 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
                         client, {t: players[t] for t in tags}, found_on, seed, max_pages,
                         on_error=lambda t, e: skip(f"battles {t}", e),
                         keep_types=RANKED_TYPES if ranked_only else None,
-                        on_done=landed, keep_deck=keep_deck)
+                        on_done=landed, keep_deck=keep_deck,
+                        reject=_rejector(exclude_cards))
                 except KeyboardInterrupt:
                     console.print("[yellow]stopped[/]")
                     break
                 for k, v in modes.items():
                     modes_all[k] = modes_all.get(k, 0) + v
                 console.print(f"[dim]{head} done · {dropped['deck']} other deck, "
-                              f"{dropped['mode']} other mode[/]")
+                              f"{dropped['mode']} other mode, "
+                              f"{dropped['card']} banned card[/]")
                 # Consecutive players whose every replay failed means the login died,
                 # not bad luck: /data/replay is the only gated call, and an expired
                 # session fails all of them. Stop rather than burn the night.
@@ -430,7 +446,8 @@ def crawl(client: Client, seed: str, players: dict[str, dict], found_on: dict[st
 # ---------------------------------------------------------------- app
 def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int = GROUP,
          outdir: Path = OUTDIR, ranked_only: bool = True, variations_only: bool = True,
-         refresh: bool = False, card: str = "", shard: tuple[int, int] | None = None) -> int:
+         refresh: bool = False, card: str = "", shard: tuple[int, int] | None = None,
+         exclude_cards: tuple[str, ...] = EXCLUDE_CARDS) -> int:
     """The whole flow with no prompts, for a long unattended run.
 
     `card` swaps the archetype definition: instead of one eight-card list and
@@ -448,6 +465,7 @@ def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int =
         f"[dim]pages[/] {max_pages or 'all'}   [dim]group[/] {group}   "
         f"[dim]ranked only[/] {ranked_only}   [dim]decks[/] {scope}\n"
         f"[dim]out[/] {outdir.resolve()}"
+        + (f"\n[dim]banned[/] {', '.join(exclude_cards)}" if exclude_cards else "")
         + (f"   [dim]shard[/] {shard[0]} of {shard[1]}" if shard else "")
         + ("   [dim]refresh[/] re-walking every player" if refresh else ""),
         title="unattended crawl", border_style="cyan", expand=False))
@@ -481,7 +499,7 @@ def auto(seed: str = SEED, min_rating: int = 0, max_pages: int = 0, group: int =
                 raise AuthError(f"shard {i} of {n} is empty for this roster")
         console.print(f"[green]{len(order)} players[/] queued")
         return crawl(client, seed, players, found_on, max_pages, ranked_only, group, outdir,
-                     keep_deck, refresh)
+                     keep_deck, refresh, exclude_cards)
     finally:
         pages.close()
 

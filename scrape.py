@@ -156,6 +156,9 @@ def run_unattended(argv: list[str]) -> int:
                     help="crawl every deck built around this card signature instead of one "
                          "fixed list, e.g. golem or pekka,battle-ram (all must be present); "
                          "overrides --deck")
+    ap.add_argument("--exclude-card", default=",".join(ui.EXCLUDE_CARDS),
+                    help="drop any battle where either side played these exact card slugs "
+                         f"(default: {','.join(ui.EXCLUDE_CARDS)}); pass '' to disable")
     ap.add_argument("--shard", default="",
                     help="split the roster across miners as i/n, e.g. 0/3. Each miner takes a "
                          "disjoint set of players, so nobody crawls the same history twice.")
@@ -179,8 +182,9 @@ def run_unattended(argv: list[str]) -> int:
         if not (i.isdigit() and n.isdigit()) or not 0 <= int(i) < int(n):
             ap.error("--shard must look like i/n with 0 <= i < n, e.g. 0/3")
         shard = (int(i), int(n))
+    banned = tuple(c.strip() for c in a.exclude_card.split(",") if c.strip())
     return ui.auto(a.deck, a.min_rating, a.pages, a.group, a.out, not a.all_modes,
-                   not a.any_deck, a.refresh, a.card, shard)
+                   not a.any_deck, a.refresh, a.card, shard, banned)
 
 
 def main() -> int:

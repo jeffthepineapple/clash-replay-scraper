@@ -33,6 +33,16 @@ def has_card(deck: str, card: str) -> bool:
     return VARIANT.sub("", card) in base_cards(deck)
 
 
+def plays_exact(deck: str, slug: str) -> bool:
+    """True if deck plays exactly this card slug, evolution form and all.
+
+    Deliberately not has_card: that strips -ev1/-hero to ask "which card is
+    this", whereas banning evolved Elite Barbarians has to distinguish
+    elite-barbarians-ev1 from plain elite-barbarians.
+    """
+    return slug in deck.split(",")
+
+
 def has_cards(deck: str, cards: Iterable[str]) -> bool:
     """True if deck plays every one of `cards`, in any evolution or hero form.
 
