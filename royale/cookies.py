@@ -1,8 +1,12 @@
-"""Find a logged-in RoyaleAPI session in whatever browser this machine has.
+"""Find a logged-in RoyaleAPI session.
 
 Browser- and OS-agnostic: every browser browser_cookie3 knows about is tried,
 whichever ones exist here answer, and the caller picks. All we want is the
 session cookie -- the Cloudflare pass comes from our own browser instance.
+
+A server has no browser profile to read, so ROYALEAPI_SESSION in the
+environment is checked first and wins outright. Copy the cookie value out of a
+desktop browser once and export it there.
 """
 
 from __future__ import annotations
@@ -43,11 +47,19 @@ def _prepare_env() -> None:
         os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={sock}"
 
 
+ENV_VAR = "ROYALEAPI_SESSION"
+
+
 def find_sessions() -> list[Session]:
-    """Every distinct RoyaleAPI session cookie found across local browsers."""
+    """Every distinct RoyaleAPI session cookie available here, env var first."""
     _prepare_env()
     out: list[Session] = []
     seen: set[str] = set()
+    env = os.environ.get(ENV_VAR, "").strip()
+    if env:
+        # Deliberately not merged with the browser jars: on a headless box there
+        # are none, and where both exist the operator's explicit choice wins.
+        return [Session("env", env)]
     for name in BROWSERS:
         fn = getattr(browser_cookie3, name, None)
         if fn is None:

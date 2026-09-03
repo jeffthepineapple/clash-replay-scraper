@@ -60,8 +60,11 @@ def pick_session() -> Session:
     with console.status("[cyan]reading browser cookie jars..."):
         found = find_sessions()
     if not found:
-        raise AuthError("no RoyaleAPI session found in any local browser -- log in at "
-                        "https://royaleapi.com/login, then rerun")
+        raise AuthError(
+            "no RoyaleAPI session found. On a desktop, log in at "
+            "https://royaleapi.com/login and rerun. On a server with no browser "
+            "profile, copy the __royaleapi_session_v2 cookie out of a desktop "
+            "browser and export ROYALEAPI_SESSION=<value>.")
     if len(found) == 1:
         console.print(f"[green]session[/] {found[0]}")
         return found[0]
